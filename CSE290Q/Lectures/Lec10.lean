@@ -14,7 +14,19 @@ and an *interactive theorem prover*.
 ## Major components
 
 - IO and runtime systems (memory management, etc.)
-  - FBIP
+  - FBIP (functional, but in-place)
+-/
+#check List
+#check Array
+set_option trace.compiler.ir.result true in
+def mkRange (n : Nat) : Array Nat := Id.run do
+  let mut arr : Array Nat := #[]
+  for i in 0...n do
+    arr := arr.push i
+  return arr
+#print mkRange
+#check Array.push
+/-!
 - Core datatypes
   - `Lean.Level`
   - `Lean.Expr`
@@ -26,9 +38,26 @@ and an *interactive theorem prover*.
     environment) plus support for efficient backtracking of state
 - Meta interface
   - Metavariable contexts, and dependency tracking
-  - Type inference
-  - Weak head normal form computation
+    - `instantiateMVars`
+    - metavariables ("existential variables" in other systems) have:
+      - a type
+      - it's possible assignment
+      - a local context
+-/
+#check _
+#check ?_
+/-!
+    - delayed assignments
+  - Type inference (`Meta.inferType`)   `Γ ⊢ e : ?_`, figures out `?_`
+  - Weak head normal form computation (`Meta.whnf`)
   - Unification and definitional equality (convertibility) checking
+    `isDefEq` ("defeq")
+    - has side effects, to solve for metavariables to make
+      expression become definitionally equal
+-/
+#check (id rfl : "hi" = if True then _ else _)
+/-!
+  - Type checking (`Meta.check`)
   - Level constraint solving
   - Expression construction
     - applications
@@ -36,26 +65,66 @@ and an *interactive theorem prover*.
   - Standard constructions (e.g. `noConfusion`)
   - "meta tactics" for low-level deduction rules
     - cases and induction
+-/
+#check Lean.MVarId.cases
+open Lean Meta Elab Tactic in
+example (n : Nat) (h : n > 0) : n ≥ 0 := by
+  run_tac withMainContext do
+    let g ← getMainGoal
+    -- guessed that index 1 is 'n'
+    let some ldecl := (← getLCtx).decls[1]! | failure
+    logInfo m!"{ldecl.toExpr}"
+    let gs ← g.cases ldecl.fvarId
+    logInfo m!"proof: {Expr.mvar g}"
+    replaceMainGoal (gs.map (fun g => g.mvarId)).toList
+  sorry
+  sorry
+/-!
     - introduction rules
+-/
+#check Lean.MVarId.intro
+example {p q : Prop} : p → q → p := by
+  intro hp hq
+  exact hp
+example {p q : Prop} : p → q → p := by
+  refine fun hp hq => ?_   -- `refine` is like `exact`, but `?_`'s
+                           -- become new goals
+  exact hp
+/-!
+Operational semantics for `intro`:
+
+by intro args...; tacs
+=> fun args... => by tacs
+-/
+#check Lean.MVarId.constructor
+/-
     - applying constructors and other functions/theorems
     - adding hypotheses
     - rewriting
   - "meta tactics" for higher-level automated reasoning
     - the simplification engine
+        it rewrites until it can't anymore, using a (hopefully)
+        confluent rewrite system
     - the grind engine
+    - `bv_decide`
+  - Recursive definition analysis/recompilation ("equation compiler")
+    - structural recursion
+    - well-founded recursion
+    - coinductive fixpoints
 - Elaborator interface
-  - Macro system
+  - Macro system (Syntax -> Syntax)
     - Macro scopes and quasiquotations
-  - Term elaboration
+    - `syntax`, `macro`, `notation`, `infix`
+  - Term elaboration (Syntax -> Expr)
     - utilities for transforming `Lean.Syntax` into `Lean.Expr`
     - elaborators for built-in syntaxes
     - coercion system
     - typeclass system
     - postponement system
-  - Tactic elaboration
+  - Tactic elaboration (Syntax -> TacticM)
     - metavariable and goal handling
     - elaborators for built-in tactics
-  - Command elaboration
+  - Command elaboration (Syntax -> CommandM)
     - elaborators for built-in commands
     - `def`/`theorem`/`example`
     - `inductive`/`structure`
