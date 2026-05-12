@@ -1,0 +1,626 @@
+import Lean
+
+/-!
+# Lean system overview (continued)
+
+Goal: Understand the organization of Lean 4
+system internals, and how they interoperate
+to support its use as a *programming language*
+and an *interactive theorem prover*.
+
+-/
+
+/-!
+## Major components
+
+- IO and runtime systems (memory management, etc.)
+  - FBIP (functional, but in-place)
+-/
+#check List
+#check Array
+set_option trace.compiler.ir.result true in
+def mkRange (n : Nat) : Array Nat := Id.run do
+  let mut arr : Array Nat := #[]
+  for i in 0...n do
+    arr := arr.push i
+  return arr
+#print mkRange
+#check Array.push
+/-!
+- Core datatypes
+  - `Lean.Level`
+  - `Lean.Expr`
+  - `Lean.LocalContext`
+  - `Lean.Environment`
+    - environment extensions
+- Core interface
+  - Basic state maintenance (configuration and the current
+    environment) plus support for efficient backtracking of state
+- Meta interface
+  - Metavariable contexts, and dependency tracking
+    - `instantiateMVars`
+    - metavariables ("existential variables" in other systems) have:
+      - a type
+      - it's possible assignment
+      - a local context
+-/
+#check _
+#check ?_
+/-!
+    - delayed assignments
+  - Type inference (`Meta.inferType`)   `Γ ⊢ e : ?_`, figures out `?_`
+  - Weak head normal form computation (`Meta.whnf`)
+  - Unification and definitional equality (convertibility) checking
+    `isDefEq` ("defeq")
+    - has side effects, to solve for metavariables to make
+      expression become definitionally equal
+-/
+#check (id rfl : "hi" = if True then _ else _)
+/-!
+  - Type checking (`Meta.check`)
+  - Level constraint solving
+  - Expression construction
+    - applications
+    - abstracting free variables to form lambdas and function types
+-/
+open Lean Meta
+set_option pp.universes true in
+#eval do
+  let e ← mkAppM ``id #[mkNatLit 22]
+  logInfo m!"e: {e}"
+#check (22 : Int)
+/-
+  - Standard constructions (e.g. `noConfusion`)
+-/
+
+#print Nat
+#print Nat.rec
+
+def Nat.myRec {motive : Nat → Sort u}
+    (z : motive Nat.zero)
+    (s : (n : Nat) → motive n → motive n.succ)
+    (t : Nat) :
+    motive t :=
+  match t with
+  | 0 => z
+  | t'+1 => s t' (Nat.myRec z s t')
+#reduce Nat.myRec -- (so my rec is implemented using the recursor automatically)
+
+set_option pp.fieldNotation.generalized false
+example : Nat.zero ≠ Nat.succ Nat.zero := by
+  intro h
+  cases h
+
+abbrev NatNoConfusionProp (p : Prop) (a b : Nat) : Prop :=
+  Nat.recOn a
+    (Nat.recOn b
+      (p → p)
+      (fun _ _ => p))
+    (fun a' _ =>
+      (Nat.recOn b
+        p
+        (fun b' _ =>
+          (a' = b' → p) → p)))
+
+theorem natNoConfusion {p : Prop} {a b : Nat} (h : a = b) :
+    NatNoConfusionProp p a b :=
+  Eq.recOn /-(motive := fun x _ => NatNoConfusionProp p a x)-/ h <|
+    Nat.recOn /-(motive := fun y => NatNoConfusionProp p y y)-/ a
+      id
+      (fun _ _ h => h rfl)
+#print natNoConfusion
+example : Nat.zero ≠ Nat.succ Nat.zero := by
+  intro h
+  exact natNoConfusion h
+
+example (a b : Nat) (h : Nat.succ a = Nat.succ b) : a = b := by
+  exact natNoConfusion h id
+
+-- NoConfusion lets you add `a = b` to the context
+example {p : Prop} (a b : Nat) (h : Nat.succ a = Nat.succ b) : p := by
+  apply natNoConfusion h
+  intro h
+  sorry
+
+-- Using `match`
+
+abbrev NatNoConfusionProp' (p : Prop) (a b : Nat) : Prop :=
+  match a, b with
+  | Nat.zero, Nat.zero => p → p
+  | Nat.succ _, Nat.zero => p
+  | Nat.zero, Nat.succ _ => p
+  | Nat.succ a', Nat.succ b' => (a' = b' → p) → p
+
+theorem natNoConfusion' {p : Prop} {a b : Nat} (h : a = b) :
+    NatNoConfusionProp p a b :=
+  match a, h with
+  | Nat.zero, rfl => id
+  | Nat.succ _, rfl => fun h => h rfl
+
+/-
+  - "meta tactics" for low-level deduction rules
+    - cases and induction
+-/
+#check Lean.MVarId.cases
+open Lean Meta Elab Tactic in
+example (n : Nat) (h : n > 0) : n ≥ 0 := by
+  run_tac withMainContext do
+    let g ← getMainGoal
+    -- guessed that index 1 is 'n'
+    let some ldecl := (← getLCtx).decls[1]! | failure
+    logInfo m!"{ldecl.toExpr}"
+    let gs ← g.cases ldecl.fvarId
+    logInfo m!"proof: {Expr.mvar g}"
+    replaceMainGoal (gs.map (fun g => g.mvarId)).toList
+  sorry
+  sorry
+/-!
+    - introduction rules
+-/
+#check Lean.MVarId.intro
+example {p q : Prop} : p → q → p := by
+  intro hp hq
+  exact hp
+example {p q : Prop} : p → q → p := by
+  refine fun hp hq => ?_   -- `refine` is like `exact`, but `?_`'s
+                           -- become new goals
+  exact hp
+/-!
+Operational semantics for `intro`:
+
+by intro args...; tacs
+=> fun args... => by tacs
+-/
+#check Lean.MVarId.constructor
+/-
+    - applying constructors and other functions/theorems
+    - adding hypotheses
+    - rewriting
+  - "meta tactics" for higher-level automated reasoning
+    - the simplification engine
+        it rewrites until it can't anymore, using a (hopefully)
+        confluent rewrite system
+    - the grind engine
+    - `bv_decide`
+  - Recursive definition analysis/recompilation ("equation compiler")
+    - structural recursion
+    - well-founded recursion
+    - coinductive fixpoints
+- Elaborator interface
+  - Macro system (Syntax -> Syntax)
+    - Macro scopes and quasiquotations
+    - `syntax`, `macro`, `notation`, `infix`
+  - Term elaboration (Syntax -> Expr)
+    - utilities for transforming `Lean.Syntax` into `Lean.Expr`
+    - elaborators for built-in syntaxes
+    - coercion system
+    - typeclass system
+    - postponement system
+  - Tactic elaboration (Syntax -> TacticM)
+    - metavariable and goal handling
+    - elaborators for built-in tactics
+  - Command elaboration (Syntax -> CommandM)
+    - elaborators for built-in commands
+    - `def`/`theorem`/`example`
+    - `inductive`/`structure`
+    - the attribute system
+- Parser interface
+  - Commands for defining and extending Lean's syntax
+- Language Server Protocol (LSP) server
+  - The Info system
+  - RPC interfaces for responding to editor queries
+  - InfoView
+  - Proof widgets
+- Pretty printer
+  - Delaboration
+  - Parenthesis insertion
+  - Formatting
+- Compiler
+  - Transformations from elaborated declarations to IR
+  - Optimizations
+  - Transformaitons from IR to C code
+- Kernel
+  - Environment maintenance
+  - Its own implementations in C++ of typechecking
+- Lake, the build system
+
+-/
+
+
+/-!
+
+### The approximate steps that Lean takes to process a file
+
+1. Parsing.
+   Read in the text of the file and convert it to `Syntax` objects.
+   (Parentheses, operator precedence, etc.)
+
+2. Macro expansion.
+   Convert `Syntax` to simpler `Syntax` using macro definitions.
+
+3. Elaboration.
+   Convert `Syntax` to `Expr` objects, the "fully elaborated terms."
+
+   A. Metavariables for implicit arguments and other pending terms
+   B. Unification, as a consquence of "defeq" checks
+   C. Tactic evaluation,
+   D. Typeclass instance inference
+
+   Elaboration generally tries to detect and report all errors.
+
+4. Kernel typechecking.
+   Fully elaborated terms are passed to the "kernel,"
+   a small program whose sole purpose is checking the validity
+   of definitions and proofs.
+
+   The elaboration process is complex and ~~might~~ *does* have bugs.
+   The kernel is only a couple thousand lines and has been much more
+   carefully reviewed.
+
+5. Compilation.
+   Definitions that have computational content can be converted
+   into runnable programs and either evaluated using an
+   interpreter (what `#eval` uses) or compiled to C.
+
+   Much of Lean 4 is written in Lean 4.
+
+Other processes:
+
+6. Pretty printing. ("Delaboration")
+   Given an `Expr`, turn it back into a `Syntax` and then back
+   into text. There are also inverses to macros, "application unexpanders,"
+   which transform `Syntax` to `Syntax`.
+
+   Pretty printing is used to show things in the Infoview.
+
+7. Incremental and parallel elaboration.
+   In conjunction with LSP, the Lean system tries to reuse
+   work it has done, while you edit a file.
+   The results are reported live in the editor.
+
+
+-/
+
+
+/-! ### Which is metaprogramming?
+
+In a certain sense, *everything* that is done before kernel
+typechecking is metaprogramming, writing programs that write programs.
+
+We want to avoid writing terms ("programs") ourselves and
+we want to be able to express ourselves in high-level proofs.
+
+What we write serves as directives to Lean for how to actually
+write the proof.
+
+- We write convenient notations using macros
+- We write elaborators that are good at filling in implicit arguments
+- We write tactics to construct proof terms in an interactive way
+- We write commands that automatically generate auxiliary definitions
+
+Even the tactic scripts are a sort of metaprogram
+(so writing tactics themselves can be regarded as metametaprogramming)
+
+-/
+
+
+
+/-! ### What's a fully elaborated term? -/
+
+#check Lean.Syntax
+#check Lean.Expr
+
+-- Annotated and mildly simplified:
+inductive Expr' where
+  -- Variables bound by forall/fun, using de Bruijn indexing
+  | bvar (deBruijnIndex : Nat)
+
+  -- "Free" variables; to refer to local hypotheses in the current `LocalContext`.
+  -- Used for elaboration, tactics, and typechecking algorithms.
+  -- (These do not appear in fully elaborated terms.)
+  | fvar (fvarId : FVarId)
+
+  -- Metavariables; to be replaced by expressions assigned in the `MetavarContext`.
+  -- Used by the elaborator to represent expressions that will be solved for later,
+  -- for example implicit arguments, tactic proofs, postponed terms, etc.
+  -- Unification can assign them.
+  -- (These do not appear in fully elaborated terms.)
+  | mvar (mvarId : MVarId)
+
+  -- `Sort u`
+  -- `Type u := Sort (u + 1)`
+  | sort (u : Level)
+
+  -- To refer to pre-existing theorems and definitions. The `Level`s
+  -- instantiate the universe level variables for the constant.
+  | const (declName : Name) (us : List Level)
+
+  -- Applications of function arguments or theorem hypotheses
+  -- For multiple arguments, nested: `.app (.app f x) y`
+  | app (fn : Expr) (arg : Expr)
+
+  -- "λ abstractions", i.e., functions and proofs-by-intro.
+  | lam (binderName : Name) (binderType : Expr) (body : Expr)
+        (binderInfo : BinderInfo)
+
+  -- "Π types", i.e., (dependent) functions, for-alls, and implications
+  | forallE (binderName : Name) (binderType : Expr) (body : Expr)
+            (binderInfo : BinderInfo)
+
+  -- `let x := v; b` for local definitions.
+  -- Similar to `(fun x => b) v` but type-correctness of `b` can depend on the value of `x`.
+  | letE (declName : Name) (type : Expr) (value : Expr) (body : Expr)
+
+  -- Natural number literals and character strings
+  | lit : Literal → Expr'
+
+  -- Metadata attached to expressions, to direct elaboration
+  | mdata (data : MData) (expr : Expr)
+
+  -- Raw projections for "structure-like" inductive types
+  | proj (typeName : Name) (idx : Nat) (struct : Expr)
+
+
+/-! ### A bit of reflection -/
+
+#eval toExpr true
+#eval toExpr 37
+#check 37
+
+/-! ### The `theorem` command, elaborated -/
+
+theorem mp {p q : Prop} (hp : p) (hpq : p → q) : q := hpq hp
+
+theorem mp' : ∀ {p q : Prop}, p → (p → q) → q :=
+  fun hp hpq ↦ hpq hp
+
+theorem mp'_foralls :
+    ∀ {p : Prop}, ∀ {q : Prop}, ∀ (_ : p), ∀ (_ : p → q), q :=
+  @fun _ _ hp hpq ↦ hpq hp
+
+
+
+def addMpDef (thmName : Name) : TermElabM Unit := do
+  let stype ← `(∀ {p q : Prop}, p → (p → q) → q)
+  let spf ← `(@fun _ _ hp hpq ↦ hpq hp)
+  -- Elaborate the syntax for the type
+  let type ← Term.elabTerm stype none
+  -- Elaborate the syntax for the proof
+  let pf ← Term.elabTermEnsuringType spf type
+  -- Complete the elaboration
+  Term.synthesizeSyntheticMVarsNoPostponing
+  -- Create a declaration
+  let decl := Declaration.thmDecl
+    { name := thmName
+      levelParams := []
+      type := ← instantiateMVars type
+      value := ← instantiateMVars pf }
+  -- Make sure it has no lingering metavariables
+  Term.ensureNoUnassignedMVars decl
+  -- Have the kernel check the theorem and add it to the environment
+  addDecl decl
+
+#eval addMpDef `mp''
+#print mp''
+
+
+
+def addMpDef2 (thmName : Name) : MetaM Unit := do
+-- `(∀ {p q : Prop}, p → (p → q) → q)
+  let type : Expr :=
+    .forallE `p (.sort .zero)
+      (.forallE `q (.sort .zero)
+        (.forallE `hp (.bvar 1)
+          (.forallE `hpq (.forallE `a (.bvar 2) (.bvar 2) .default)
+            (.bvar 2)
+            .default)
+          .default)
+        .implicit)
+      .implicit
+-- `(@fun _ _ hp hpq ↦ hpq hp)
+  let pf : Expr :=
+    .lam `p (.sort .zero)
+      (.lam `q (.sort (.succ .zero))
+        (.lam `hp (.bvar 1)
+          (.lam `hpq (.forallE `a (.bvar 2) (.bvar 2) .default)
+            (.app (.bvar 0) (.bvar 1))
+            .default)
+          .default)
+        .implicit)
+      .implicit
+  -- Check that `type` is type correct
+  Meta.check type
+  -- Check that `pf` is type correct
+--  Meta.check pf
+  -- Check that the type of `pf` is `type`
+  unless ← Meta.isDefEq (← Meta.inferType pf) type do
+    throwError "not defeq"
+  -- Have the kernel check the theorem and add it to the environment
+  addDecl <| Declaration.thmDecl
+    { name := thmName
+      levelParams := []
+      type := type
+      value := pf }
+
+#eval addMpDef2 `mp'''
+#print mp'''
+set_option pp.proofs true
+variable (h : 1 = 1) (motive : (n : Nat) → 1 = n → Type)
+  (v : motive 1 h)
+#check Eq.recOn (motive := motive) h v
+#check Eq.recOn (motive := motive) (Eq.refl 1) v
+#reduce Eq.recOn (motive := motive) (Eq.refl 1) v
+#reduce Eq.recOn (motive := motive) h v
+#check Acc.rec
+
+/-!
+## Term elaboration ingredients
+
+- Metavariables: holes in `Expr`s that the elaborator must solve for
+- Unification: an algorithm to equate two `Expr`s
+               (and assigning metavariables along the way)
+- Term elaborators: programs to turn a `Syntax` into an `Expr`
+
+-/
+
+#check add_comm
+#check (add_comm)
+#check add_comm (1 : ℝ) 2
+
+/-
+This is what the Lean elaborator does when it
+sees `add_comm` by itself:
+-/
+def expandAddComm : TermElabM Expr := do
+  let u ← mkFreshLevelMVar
+  let G ← mkFreshExprMVar (some (.sort (.succ u)))
+  let instTy : Expr := .app (.const ``AddCommMagma [u]) G
+  let inst ← mkFreshExprMVar (some instTy)
+  Term.registerSyntheticMVarWithCurrRef inst.mvarId! (.typeClass none)
+  return .app (.app (.const ``add_comm [u]) G) inst
+
+#eval expandAddComm
+
+/--  A term elaborator to test `expandAddComm` -/
+elab "mkAddCommExpr" : term => expandAddComm
+
+#check mkAddCommExpr
+
+#check mkAddCommExpr (1 : ℝ) 2
+
+#check (mkAddCommExpr : ∀ (a b : ℝ), a + b = b + a)
+
+-- In this example, `thm`'s metavariables get solved for
+-- due to `thm (1 : ℝ) 2`
+#check
+  let thm := mkAddCommExpr
+  PProd.mk (thm (1 : ℝ) 2) thm
+-- has type PProd (1 + 2 = 2 + 1) (∀ (a b : ℝ), a + b = b + a)
+
+
+
+/-!
+### What's a metavariable exactly?
+
+Their full definition requires a few pieces:
+
+- The `Expr.mvar` terms in an expression, representing holes
+
+- A table of `mvarId -> Expr` mappings for metavariables that
+  have been assigned a value, potentially another metavariable.
+  (The `instantiateMVars` command does the final replacement.)
+
+- A table of `mvarId -> Expr` mappings for the type of each
+  metavariable (which might themselves contain metavariables)
+
+- A local context for each metavariable, which controls which
+  `Expr.fvar`s are allowed when assigning a metavariable.
+
+Hint: each goal in the Infoview *is* an unassigned metavariable.
+Lean shows us the local context and type of each goal metavariable.
+
+-/
+
+
+/-!
+## Tactic elaboration ingredients
+
+The `by ...` notation has a term elaborator that sets up tactic mode.
+
+Tactic mode consists of a list of metavariables called *goals*.
+
+The `by ...` itself is replaced with a single metavariable, the
+first goal to be proved.
+
+Tactics are programs that manipulate the goals.
+
+-/
+
+example (p : Prop) : p → p := by
+  sorry
+
+example (p : Prop) : p → p := by
+  intro h
+  sorry
+
+-- This is the same as...
+
+example (p : Prop) : p → p := fun h => by
+  sorry
+
+example (p : Prop) : p → p := fun h => by
+  exact h
+
+-- This is the same as...
+
+example (p : Prop) : p → p := fun h => h
+
+
+elab "myIntro " nameStx:ident : tactic => do
+  let name : Name := nameStx.getId
+  let g : MVarId ← Tactic.getMainGoal
+  g.withContext do
+    let tgt : Expr ← g.getType'
+    match tgt with
+    | .forallE _ ty body bi =>
+      withLocalDecl name bi ty fun arg => do
+        let body' := body.instantiate1 arg
+        let g' ← mkFreshExprSyntheticOpaqueMVar body'
+        g.assign (← mkLambdaFVars #[arg] g')
+        Tactic.replaceMainGoal [g'.mvarId!]
+    | _ => throwError "Goal is not a forall/implication"
+
+elab "myExact " t:term : tactic => do
+  let g : MVarId ← Tactic.getMainGoal
+  g.withContext do
+    let tgt : Expr ← g.getType
+    let e : Expr ← Term.elabTermEnsuringType t tgt
+    g.assign e
+    Tactic.replaceMainGoal []
+
+theorem myThm (p : Prop) : p → p := by
+  myIntro hp
+  myExact hp
+
+#print myThm
+
+
+-- What keeps tactics from giving bogus proofs?
+
+elab "myBad" : tactic => do
+  let g : MVarId ← Tactic.getMainGoal
+  let v : Expr := toExpr 37
+  g.assign v
+
+example : 1 = 2 := by
+  myBad
+
+
+/-- Hard-coded `constructor` for a couple types. -/
+elab "split_goal" : tactic =>
+  Tactic.liftMetaTactic fun g => do
+    let tgt ← g.getType'
+    match tgt.getAppFn with
+    | .const ``Iff _ =>
+      g.apply (← mkConstWithFreshMVarLevels ``Iff.intro)
+    | .const ``And _ =>
+      g.apply (← mkConstWithFreshMVarLevels ``And.intro)
+    | _ => throwError "Don't know how to handle this target type."
+
+example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by
+  split_goal
+  · assumption
+  · assumption
+
+-- This can be done mildly more inefficiently with a macro too.
+macro "split_goal'" : tactic =>
+  `(tactic|
+      first
+      | apply Iff.intro
+      | apply And.intro
+      | fail "Don't know how to handle this target.")
+
+example (p q : Prop) (hp : p) (hq : q) : p ∧ q := by
+  split_goal'
+  · assumption
+  · assumption
