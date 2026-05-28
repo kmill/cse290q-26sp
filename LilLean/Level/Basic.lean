@@ -17,8 +17,15 @@ namespace LilLean
 
 variable {ℓ : Type}
 
-def Level.hashAddOffset (h : UInt64) (offset : Nat) : UInt64 :=
-  h + (offset.toUInt64 <<< 2)
+/--
+`mixed` is a hash computation, and `bits` is the lower-order bits encoding
+`levelHasParam` and `levelHasMVar`.
+-/
+private def Level.mkHash (mixed : UInt64) (bits : UInt64) : UInt64 :=
+  (mixed &&& ~~~3) ||| (bits &&& 3)
+
+def Level.hashOffset (hv : UInt64) (offset : Nat) : UInt64 :=
+  mkHash (mixHash hv offset.toUInt64) hv
 
 /--
 Standard hash computation for levels, given a function `getHash` that returns
@@ -26,18 +33,17 @@ hashes for levels within `u`.
 
 Lowest two bits encode hasParam (bit 0) and hasMVar (bit 1).
 The hash of `Level.zero` is `0`.
-
-Offsets are incorporated in a simple way.
 -/
-def Level.hashCore (u : Level ℓ) (offset : Nat)
-    (getHash : ℓ → UInt64) : UInt64 :=
-  let mkHash (mixed : UInt64) (bits : UInt64) : UInt64 :=
-    hashAddOffset ((mixed &&& ~~~3) ||| (bits &&& 3)) offset
+def Level.hashCore (u : Level ℓ) (getHash : ℓ → UInt64) : UInt64 :=
   match u with
   | .zero => 0
-  | .succ v =>
+  | .offset v n =>
+    -- Note: we distinguish between `Level.offset (Level.offset u c) d` and
+    -- `Level.offset u (c + d)` in the hash computation since they are
+    -- structurally different. It is up to `Level` constructions to collapse
+    -- offset expressions.
     let hv := getHash v
-    hashAddOffset hv (offset + 1)
+    hashOffset hv n
   | .max v w =>
     let hv := getHash v
     let hw := getHash w
@@ -48,10 +54,17 @@ def Level.hashCore (u : Level ℓ) (offset : Nat)
     mkHash (mixHash 5 <| mixHash hv hw) (hv ||| hw)
   | .param n =>
     let hn := hash n
-    mkHash (mixHash 6 hn) 1
+    mkHash (mixHash 6 hn) 1 -- set bit 0
   | .mvar mvarId =>
     let hm := hash mvarId
-    mkHash (mixHash 7 hm) 2
+    mkHash (mixHash 7 hm) 2 -- set bit 1
+
+/-- Specialization of `Level.hashCore` for hashing a constant level. -/
+def Level.hashConst (c : Nat) : UInt64 :=
+  if c == 0 then
+    0
+  else
+    hashOffset 0 c
 
 def Level.isZero : Level ℓ → Bool
   | .zero => true
@@ -60,56 +73,93 @@ def Level.isZero : Level ℓ → Bool
 section
 variable {m : Type → Type} [Monad m]
 
+/--
+Applies `f` to (non-recursively) update handles.
+-/
+def Level.mapM (f : ℓ → m ℓ) (u : Level ℓ) : m (Level ℓ) := do
+  match u with
+  | .zero => return u
+  | .offset v n => return .offset (← f v) n
+  | .max v w => return .max (← f v) (← f w)
+  | .ipos v w => return .ipos (← f v) (← f w)
+  | .param _ => return u
+  | .mvar _ => return u
+
 section
 variable [MonadGetLevel m ℓ]
 
+/--
+Returns whether or not the level contains a metavariable.
+Note: Even if the metavariables might be assigned with respect to the current
+metavariable context, this will still return true.
+-/
+def levelHasMVar (u : ℓ) : m Bool := do
+  return (← levelHash u) &&& 2 > 0
+
+/--
+Returns whether or not the level contains a parameter.
+-/
+def levelHasParam (u : ℓ) : m Bool := do
+  return (← levelHash u) &&& 1 > 0
+
+/--
+Returns whether or not the level is exactly `Level.zero`.
+-/
 def isLevelZero (u : ℓ) : m Bool :=
   return (← getLevel u).isZero
 
 /--
-Returns `true` if `u` is zero, no matter the assignments to metavariables
-or parameters.
+Follows `Level.offset` and returns a non-`offset` level plus the total offset.
 -/
-partial def isLevelAlwaysZero (u : ℓ) : m Bool := do
-  match ← getLevel u with
-  | .zero => return true
-  | .succ _ => return false
-  | .mvar _ => return false
-  | .param _ => return false
-  | .ipos v w => isLevelAlwaysZero v <||> isLevelAlwaysZero w
-  | .max v w => isLevelAlwaysZero v <&&> isLevelAlwaysZero w
+partial def getLevelOffset (u : ℓ) : m (ℓ × Nat) :=
+  go u 0
+where
+  go (u : ℓ) (c : Nat) : m (ℓ × Nat) := do
+    match (← getLevel u) with
+    | .offset u' c' => go u' (c + c')
+    | _ => return (u, c)
 
 /--
-Returns `true` if `u` is never zero, no matter the assignments to metavariables
-or parameters.
+Returns `true` if `u` is equivalent to zero, for all assignments to
+metavariables and parameters.
+-/
+partial def isLevelAlwaysZero (u : ℓ) : m Bool := do
+  match (← getLevel u) with
+  | .zero => return true
+  | .offset v n => pure (n == 0) <&&> isLevelAlwaysZero v
+  | .max v w => isLevelAlwaysZero v <&&> isLevelAlwaysZero w
+  | .ipos v w => isLevelAlwaysZero v <||> isLevelAlwaysZero w
+  | .param _ => return false
+  | .mvar _ => return false
+
+/--
+Returns `true` if `u` is not equivalent to zero, for all assignments to
+metavariables and parameters.
 -/
 partial def isLevelNeverZero (u : ℓ) : m Bool := do
-  match ← getLevel u with
+  match (← getLevel u) with
   | .zero => return false
-  | .succ _ => return true
-  | .mvar _ => return false
-  | .param _ => return false
-  | .ipos v w => isLevelNeverZero v <&&> isLevelNeverZero w
+  | .offset v n => pure (n > 0) <||> isLevelNeverZero v
   | .max v w => isLevelNeverZero v <||> isLevelNeverZero w
+  | .ipos v w => isLevelNeverZero v <&&> isLevelNeverZero w
+  | .param _ => return false
+  | .mvar _ => return false
 
 /--
 Returns `true` if `u` and `v` are structurally equal.
 -/
 partial def levelEq [BEq ℓ] (u v : ℓ) : m Bool := do
-  let (u', uOffset) ← getLevelOffset u
-  let (v', vOffset) ← getLevelOffset v
-  if uOffset != vOffset then
-    return false
-  if u' == v' then
+  if u == v then
     return true
-  if (← levelHash u') != (← levelHash v') then
+  if (← levelHash u) != (← levelHash v) then
     return false
-  match (← getLevel u'), (← getLevel v') with
+  match (← getLevel u), (← getLevel v) with
   | .zero, .zero => return true
-  | .mvar uMVarId, .mvar vMVarId => return uMVarId == vMVarId
-  | .param un, .param vn => return un == vn
-  | .ipos ua ub, .ipos va vb => levelEq ua va <&&> levelEq ub vb
+  | .offset ua un, .offset va vn => pure (un == vn) <&&> levelEq ua va
   | .max ua ub, .max va vb => levelEq ua va <&&> levelEq ub vb
+  | .ipos ua ub, .ipos va vb => levelEq ua va <&&> levelEq ub vb
+  | .param un, .param vn => return un == vn
+  | .mvar uMVarId, .mvar vMVarId => return uMVarId == vMVarId
   | _, _ => return false
 
 end
@@ -125,22 +175,19 @@ def mkLevelConst (n : Nat) : m ℓ := do
 def mkLevelIMax (u v : ℓ) : m ℓ := do
   mkLevelMax (← mkLevelIPos u v) v
 
+/-- Makes `u + 1`. -/
+def mkLevelSucc (u : ℓ) : m ℓ := do
+  mkLevelOffset u 1
+
 section Update
 variable [MonadGetLevel m ℓ] [BEq ℓ]
 
-/-- Does `mkLevelSucc newU`, but returns `orig` if possible. -/
-def updateLevelSucc (orig newU : ℓ) : m ℓ := do
-  if let .succ u ← getLevel orig then
-    if u == newU then
+/-- Does `mkLevelOffset newU newC`, but returns `orig` if possible. -/
+def updateLevelOffset (orig newU : ℓ) (newC : Nat) : m ℓ := do
+  if let .offset u c ← getLevel orig then
+    if c == newC && u == newU then
       return orig
-  mkLevelSucc newU
-
-/-- Does `mkLevelOffset newU newOffset`, but returns `orig` if possible. -/
-def updateLevelOffset (orig newU : ℓ) (newOffset : Nat) : m ℓ := do
-  let (u, offset) ← getLevelOffset orig
-  if offset == newOffset && u == newU then
-    return orig
-  mkLevelOffset newU newOffset
+  mkLevelOffset newU newC
 
 /-- Does `mkLevelMax' newU newV`, but returns `orig` if possible. -/
 def updateLevelMax (orig newU newV : ℓ) : m ℓ := do
@@ -156,6 +203,50 @@ def updateLevelIPos (orig newU newV : ℓ) : m ℓ := do
       return orig
   mkLevelIPos newU newV
 
+/--
+Applies `f` to update handles (non-recursively).
+-/
+def levelMapM (f : ℓ → m ℓ) (u : ℓ) : m ℓ := do
+  match (← getLevel u) with
+  | .zero => return u
+  | .offset v n => updateLevelOffset u (← f v) n
+  | .max v w => updateLevelMax u (← f v) (← f w)
+  | .ipos v w => updateLevelIPos u (← f v) (← f w)
+  | .param _ => return u
+  | .mvar _ => return u
+
+/--
+Replaces parameters in `u` using `f`.
+-/
+partial def levelReplaceParams (f : Name → m (Option ℓ)) (u : ℓ) : m ℓ := do
+  if (← levelHasParam u) then
+    match (← getLevel u) with
+    | .param n =>
+      if let some u' ← f n then
+        return u'
+      else
+        return u
+    | _ =>
+      levelMapM (levelReplaceParams f) u
+  else
+    return u
+
+/--
+Replaces levels in `u` using `f`.
+-/
+partial def levelReplaceMVars (f : LMVarId → m (Option ℓ)) (u : ℓ) : m ℓ := do
+  if (← levelHasMVar u) then
+    match (← getLevel u) with
+    | .mvar mvarId =>
+      if let some u' ← f mvarId then
+        return u'
+      else
+        return u
+    | _ =>
+      levelMapM (levelReplaceMVars f) u
+  else
+    return u
+
 end Update
 
 section
@@ -166,19 +257,13 @@ Like `mkLevelMax u v`, but returns `u` or `v` if simple checks detect that
 one subsumes the other.
 -/
 partial def mkLevelMax' [BEq ℓ] (u v : ℓ) : m ℓ := do
-  if u == v then
-    return u
-  if (← isLevelZero u) then
-    return v
-  if (← isLevelZero v) then
-    return u
-  let (u', uOffset) ← MonadGetLevel.getLevelOffset u
-  let (v', vOffset) ← MonadGetLevel.getLevelOffset v
+  let (u', uOffset) ← getLevelOffset u
+  let (v', vOffset) ← getLevelOffset v
   if ← levelEq u' v' then
     return if uOffset ≥ vOffset then u else v
-  if (← isLevelZero u') && uOffset ≤ vOffset then
+  if (← isLevelAlwaysZero u') && uOffset ≤ vOffset then
     return v
-  if (← isLevelZero v') && uOffset ≥ vOffset then
+  if (← isLevelAlwaysZero v') && uOffset ≥ vOffset then
     return u
   mkLevelMax u v
 
@@ -187,9 +272,9 @@ Like `mkLevelIPos u v`, but returns `0` or `u` if simple checks detect
 the expression can be simplified.
 -/
 partial def mkLevelIPos' [BEq ℓ] (u v : ℓ) : m ℓ := do
-  if u == v then
+  if ← levelEq u v then
     return u
-  if (← isLevelZero u <||> isLevelZero v) then
+  if (← isLevelAlwaysZero u <||> isLevelAlwaysZero v) then
     return ← mkLevelZero
   if (← isLevelNeverZero v) then
     return u
@@ -210,14 +295,16 @@ For simplicity of discussion, let's call both parameters and metavariables
 
 To prove two level expressions are equivalent, we can put the expressions into
 normal form and check equality. We could get away with a mere simplification
-routine if it handles common cases --- in Lean 4, expressions with `imax` do
-are merely simplified, not normalized --- but in LilLean opt for a complete
+routine if it handles common cases --- in Lean 4, expressions with `imax`
+are merely simplified, not normalized --- but in LilLean we opt for a complete
 normalization routine.
 
 For levels without any impredicativity handling (i.e., those without `ipos`),
 normal forms are straightforward. Given level expressions `u,v,w` and concrete
 levels `c,d` ("concrete" means a successor of zero), we have the following
 rewrite rules:
+- `u + 0 = u`
+- `(u + c) + d = u + (c+d)`
 - `max u 0 = u`
 - `max 0 u = u`
 - `max (max u v) w = max u (max v w)` (and we write `max u v w` for the latter)
@@ -242,8 +329,8 @@ expression. These tests are represented by `isLevelAlwaysZero` and
 - `max u v > 0` iff `u > 0` or `v > 0`
 - `ipos u v = 0` iff `u = 0` or `v = 0`
 - `ipos u v > 0` iff `u > 0` and `v > 0`
-If we know whether each variable is zero or positive, these are sufficient
-to simplify `ipos` expressions
+Knowing whether each variable is zero or positive is sufficient
+to simplify and eliminate `ipos` expressions
 
 An interesting property of `ipos` is that it is associative
 (`ipos u (ipos v w) = ipos (ipos u v) w`), which justifies writing
@@ -275,7 +362,7 @@ and then normalized into forms not containing `ipos` expressions.
 Theoretically, we could test these `Set Variable → Level` functions for
 equality, which is exactly testing level equivalence.
 
-So, we can encode these `f : Set Variable -> Level` functions by taking
+So, we can encode these `f : Set Variable → Level` functions by taking
 `max_{vs : Set Variable} ipos (f vs) (ipos ...vs...)`, which we can simplify
 according to the above rules. We do not prove uniqueness of normal forms here.
 (The concepts I have in mind for proving it are (1) the "`u`-content" of a
@@ -308,7 +395,8 @@ variable [MonadGetLevel m ℓ]
 /--
 Folds over all components of a `max` level expression while distributing
 offsets. Calls `f` with each `u'+offset` pair. The level `u'` is zero, a
-parameter, a metavariable, or an `ipos` expression.
+parameter, a metavariable, or an `ipos` expression,
+never an `offset` expression.
 
 For example, `max ((max u v) + 2) w` will call `f` on `u+2`, `v+2`, and `f w`.
 -/
@@ -324,15 +412,19 @@ where
     | .max v w => go w offset' (← go v offset' init)
     | _ => f init u' offset'
 
+/--
+Used for normalization (see `LevelMaxTerm`).
+Records the base expression, as well as an existing level expression that
+represents it, to reuse it later.
+-/
 inductive LevelBase (ℓ : Type) where
   | zero
   | param (u : ℓ) (n : Name)
   | mvar (u : ℓ) (mvarId : LMVarId)
   deriving Inhabited
 
-def LevelBase.isZero : LevelBase ℓ → Bool
-  | .zero => true
-  | _ => false
+def LevelBase.isZero (b : LevelBase ℓ) : Bool :=
+  b matches .zero
 
 def LevelBase.eq : LevelBase ℓ → LevelBase ℓ → Bool
   | .zero, .zero => true
@@ -355,34 +447,40 @@ Represents `ipos (base+offset) (ipos ...cond...)`
 -/
 structure LevelMaxTerm (ℓ : Type) where
   base : LevelBase ℓ
-  /-- if `base == .zero` then `offset > 0` -/
+  /-- if `base.isZero` then `offset > 0` -/
   offset : Nat
-  /-- parameters and metavariables, in `LevelBase.lt` order. -/
+  /-- parameters and metavariables (no `.zero`), in `LevelBase.lt` order. -/
   cond : Array (LevelBase ℓ)
   deriving Inhabited
 
 /--
 Compares by base, then `cond` in size, then `cond` in lex order,
-then offset in opposite order.
+then offset in descending order.
+The purpose of this is for the subsumption check: we only need to check
+subsumption (with `LevelMaxTerm.subsumes`) if `t1.lt t2`.
 -/
 def LevelMaxTerm.lt (t1 t2 : LevelMaxTerm ℓ) : Bool :=
-  t1.base.lt t2.base || (t1.base.eq t2.base &&
+  have : BEq (LevelBase ℓ) := ⟨LevelBase.eq⟩
+  t1.base.lt t2.base || (t1.base == t2.base &&
     t1.cond.size < t2.cond.size || (t1.cond.size == t2.cond.size &&
-      have : BEq (LevelBase ℓ) := ⟨LevelBase.eq⟩
       Array.lex t1.cond t2.cond LevelBase.lt || (t1.cond == t2.cond &&
         t1.offset > t2.offset)))
 
 /--
-Returns true if `t1 ≥ t2`, hence `t2` is unnecessary (is *subsumed* by `t1`).
+Returns true if `t1 ≥ t2` as level expressions,
+hence `t2` is unnecessary (is *subsumed* by `t1`).
 -/
 def LevelMaxTerm.subsumes (t1 t2 : LevelMaxTerm ℓ) : Bool :=
-  (t2.base.isZero || t1.base.eq t2.base)
-    && t1.offset ≥ t2.offset
+  t1.offset ≥ t2.offset
+    && (t2.base.isZero || t1.base.eq t2.base)
     && t1.cond.all (t2.cond.binSearchContains · LevelBase.lt)
 
+def LevelMaxTerm.eq (t1 t2 : LevelMaxTerm ℓ) : Bool :=
+  have : BEq (LevelBase ℓ) := ⟨LevelBase.eq⟩
+  t1.offset == t2.offset && t1.base == t2.base && t1.cond == t2.cond
+
 /--
-Used for normalization.
-Represents `max ...terms...`
+Used for normalization. Represents `max ...terms...`
 -/
 structure LevelMaxView (ℓ : Type) where
   /-- Terms in `LevelMaxTerm.lt` order. -/
@@ -392,6 +490,10 @@ structure LevelMaxView (ℓ : Type) where
 def LevelMaxView.insert {ℓ} (view : LevelMaxView ℓ) (term : LevelMaxTerm ℓ) :
     LevelMaxView ℓ :=
   { view with terms := view.terms.binInsert LevelMaxTerm.lt term }
+
+def LevelMaxView.eq (view1 view2 : LevelMaxView ℓ) : Bool :=
+  have : BEq (LevelMaxTerm ℓ) := ⟨LevelMaxTerm.eq⟩
+  view1.terms == view2.terms
 
 /-- Computes the view of `max (u + offset) view`. -/
 partial def accLevelMaxView (u : ℓ) (offset : Nat) (view : LevelMaxView ℓ) :
@@ -449,7 +551,7 @@ def mkLevelMaxView (u : ℓ) (offset : Nat := 0) : m (LevelMaxView ℓ) :=
 /--
 Eliminates terms that are implied by others.
 -/
-def LevelMaxView.normalize (view : LevelMaxView ℓ) : LevelMaxView ℓ :=
+def LevelMaxView.simplify (view : LevelMaxView ℓ) : LevelMaxView ℓ :=
   if view.terms.isEmpty then
     view
   else Id.run do
@@ -459,11 +561,11 @@ def LevelMaxView.normalize (view : LevelMaxView ℓ) : LevelMaxView ℓ :=
     for h : i in [1:view.terms.size] do
       let term := view.terms[i]
       if term.base matches .zero then
-        -- Need to compare to *all* previous terms
+        -- Need to check subsumption with *all* previous terms
         if !terms.any (LevelMaxTerm.subsumes · term) then
           terms := terms.push term
       else if term.base.eq currTerm.base then
-        -- Can compare to just those with the same base
+        -- Can check subsumption with just those with the same base
         if !terms.any (LevelMaxTerm.subsumes · term) (start := baseIdx) then
           terms := terms.push term
       else
@@ -471,6 +573,47 @@ def LevelMaxView.normalize (view : LevelMaxView ℓ) : LevelMaxView ℓ :=
         terms := terms.push term
         currTerm := term
     return { terms }
+
+/--
+Returns true if the level is already obviously in normal form.
+This is used to save work while normalizating level expressions.
+This currently handles everything that doesn't have `ipos` expressions.
+-/
+partial def levelIsAlreadyNormalizedQuick (u : ℓ) : m Bool := do
+  if (← getAtom? u).isSome then
+    return true
+  else
+    match (← getLevel u) with
+    | .max v w =>
+      let some (b, c) ← getAtom? v | return false
+      visitMax b c w
+    | _ => return false
+where
+  getAtom? (u : ℓ) : m (Option (LevelBase ℓ × Nat)) := do
+    let (u, u', c) ←
+      match (← getLevel u) with
+      | .offset v c =>
+        if c == 0 then return none
+        else pure (v, ← getLevel v, c)
+      | u' => pure (u, u', 0)
+    match u' with
+    | .zero => return some (.zero, c)
+    | .param n => return some (.param u n, c)
+    | .mvar mvarId => return some (.mvar u mvarId, c)
+    | _ => return none
+  visitMax (curr : LevelBase ℓ) (maxOffset : Nat) (u : ℓ) : m Bool := do
+    match (← getLevel u) with
+    | .max v w =>
+      let some (b, c) ← getAtom? v | return false
+      unless curr.lt b do return false
+      visitMax b (max maxOffset c) w
+    | _ =>
+      let some (b, c) ← getAtom? u | return false
+      unless curr.lt b do return false
+      if b.isZero then
+        return maxOffset < c
+      else
+        return true
 
 variable [MonadMkLevel m ℓ]
 
@@ -482,7 +625,7 @@ def LevelBase.mkLevel (b : LevelBase ℓ) : m ℓ :=
 
 def LevelMaxTerm.mkLevel (t : LevelMaxTerm ℓ) : m ℓ := do
   let u ← t.base.mkLevel
-  let u ← if t.offset > 0 then mkLevelOffset u t.offset else pure u
+  let u ← mkLevelOffset u t.offset
   if t.cond.isEmpty then
     return u
   else
@@ -502,9 +645,15 @@ def LevelMaxView.mkLevel (view : LevelMaxView ℓ) : m ℓ := do
 /--
 Puts a level expression into normal form.
 Does not instantiate level metavariables.
+
+Uses an evaluation/simplification/reflection approach, using `LevelMaxView`
+as an intermediate representation.
 -/
 def normalizeLevel (u : ℓ) : m ℓ := do
-  (← mkLevelMaxView u).normalize.mkLevel
+  if ← levelIsAlreadyNormalizedQuick u then
+    return u
+  else
+    (← mkLevelMaxView u).simplify.mkLevel
 
 end Normalize
 
@@ -513,18 +662,26 @@ variable [MonadMkLevel m ℓ] [MonadGetLevel m ℓ]
 
 /--
 Returns true if the levels are equivalent.
+We do this by checking that the normalized levels are equal,
+that is, the reference implementation is
+```
+levelEq (← normalizeLevel u) (← normalizeLevel v)
+```
+However, we can skip the reification step and compare `LevelMaxView`s directly.
 -/
 partial def levelEquiv [BEq ℓ] (u v : ℓ) : m Bool := do
   if ← levelEq u v then
     return true
   else
-    let u ← normalizeLevel u
-    let v ← normalizeLevel v
-    levelEq u v
+    let uView := (← mkLevelMaxView u).simplify
+    let vView := (← mkLevelMaxView v).simplify
+    return uView.eq vView
 
 /--
 Returns true if for all concrete assignments of variables in `u` and `v`
 the first is less than or equal to the second.
+
+If `levelLE u v` and `levelLE v u` then `levelEquiv u v`.
 -/
 partial def levelLE (u v : ℓ) : m Bool := do
   let uView ← mkLevelMaxView u

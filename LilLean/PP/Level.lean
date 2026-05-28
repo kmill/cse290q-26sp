@@ -24,23 +24,22 @@ partial def delabLevel (u : ℓ) : m (Lean.TSyntax `lilLevel) :=
   visit u
 where
   visit (u : ℓ) : m (Lean.TSyntax `lilLevel) := do
-    let (u', offset) ← getLevelOffset u
-    let addOffset (stx : Lean.TSyntax `lilLevel) : m (Lean.TSyntax `lilLevel) :=
-      if offset == 0 then
-        return stx
-      else
-        `(lilLevel| $stx + $(Lean.quote offset):num)
-    match (← getLevel u') with
-    | .zero => `(lilLevel| $(Lean.quote offset):num)
-    | .succ _ => unreachable!
+    match (← getLevel u) with
+    | .zero => `(lilLevel| 0)
+    | .offset u' n =>
+      match (← getLevel u') with
+      | .zero => `(lilLevel| $(Lean.quote n):num)
+      | _ =>
+        let stx ← visit u'
+        `(lilLevel| $stx + $(Lean.quote n):num)
     | .mvar mvarId =>
       -- Create a pseudo identifier for the level metavariable
       let s := Lean.mkIdent <| Lean.Name.mkSimple <| s!"?u.{mvarId.id+1}"
-      `(lilLevel| $s:ident) >>= addOffset
+      `(lilLevel| $s:ident)
     | .param n =>
-      `(lilLevel| $(Lean.mkIdent n):ident) >>= addOffset
-    | .max .. => visitMax u' #[] >>= addOffset
-    | .ipos .. => visitIPos u' #[] >>= addOffset
+      `(lilLevel| $(Lean.mkIdent n):ident)
+    | .max .. => visitMax u #[]
+    | .ipos .. => visitIPos u #[]
   visitMax (u : ℓ) (acc : Array (Lean.TSyntax `lilLevel)) :
       m (Lean.TSyntax `lilLevel) := do
     match (← getLevel u) with

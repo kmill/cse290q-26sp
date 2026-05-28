@@ -6,13 +6,15 @@ Authors: Kyle Miller
 
 module
 public import LilLean.Level.Context
-public import LilLean.Expr.Types
+public import LilLean.Expr.Basic
 
 /-!
 # Expression context
 
 This module defines an *expression context*, which is a memory manager for
 expressions. See `LilLean.Level.Context` for some discussion.
+
+The expression context contains a level context.
 -/
 
 public section
@@ -20,165 +22,199 @@ public section
 namespace LilLean
 
 /--
-In an expression handle, the lower bits are an index into a block, and the
-higher bits are an index for the block itself.
+Handle for an `Expr` managed by a `ExprContext`.
 -/
-private def exprContextBlockSizeBits : Nat := 8
+structure ExprId where private mk ::
+  /--
+  Bits 0-23: UInt24 block ID
+  Bits 24-32: UInt9 index into the block
+  Bits 48-63: UInt16 generation counter (to try to detect use-after-free bugs)
 
-private def exprContextBlockSize : Nat :=
-  1 <<< exprContextBlockSizeBits
+  If the block id is -1, then bits 24-43 denote the index for `Expr.bvar`
+  -/
+  idx : UInt64
+  deriving BEq
+
+instance : Hashable ExprId where
+  hash := private ExprId.idx
+
+private def exprIdBlockMask : UInt64 := ((1 <<< 24) - 1).toUInt64
+
+def ExprId.bvar0 : ExprId :=
+  { idx := exprIdBlockMask }
+
+instance : Inhabited ExprId := ⟨ExprId.bvar0⟩
+
+def ExprId.bvar (idx : Nat) : ExprId :=
+  assert! idx + 1 < (1 <<< 20)
+  { idx := exprIdBlockMask ||| (idx.toUInt64 <<< 24) }
 
 /--
-Handle for `Expr` expressions, for use with `ExprContext`.
+ID for a memory block in the `ExprContext`.
 -/
-structure ExprId where
-  /-- Index for the expression. Lowest `exprContextBlockSizeBits` bits are an
-  index into a block, and the higher bits are the block index. Block `0` is
-  reserved to represent small `Expr.bvar`s. -/
-  idx : UInt32
-  /-- A generation counter for detecting use-after-free bugs. Block IDs are
-  reused, but their generation is bumped up. This counter will wrap around after
-  long periods of operation, so false negatives are possible. -/
-  generation : UInt16
-  deriving DecidableEq
-
-def ExprId.bvar (idx : Nat) : ExprId where
-  idx :=
-    if idx < exprContextBlockSize then idx.toUInt32
-    else panic!"bvar index too large"
-  generation := 0
-
-instance : Inhabited ExprId := ⟨.bvar 0⟩
-
-structure ExprBlockId where
+private structure ExprBlockId where
   id : Nat
   deriving Inhabited
 
-structure ExprRegionId where
-  id : Nat
+/--
+ID for a region in the `ExprContext`.
+-/
+structure ExprRegionId where private mk ::
+  private id : Nat
   deriving Inhabited
 
-structure ExprBlock where
+private inductive ExprIdView where
+  | bvar (idx : Nat)
+  | handle (blockId : ExprBlockId) (idx : Nat) (generation : UInt16)
+
+@[inline]
+private def ExprId.view (u : ExprId) : ExprIdView :=
+  if u.idx &&& exprIdBlockMask == exprIdBlockMask then
+    ExprIdView.bvar (u.idx >>> 24).toNat
+  else
+    let blockId : ExprBlockId := { id := (u.idx &&& exprIdBlockMask).toNat }
+    let idx := ((u.idx >>> 24) &&& 511).toNat
+    let generation := (u.idx >>> 48).toUInt16
+    ExprIdView.handle blockId idx generation
+
+private instance : ToString ExprIdView where
+  toString
+    | .bvar idx => s!"(bvar {idx})"
+    | .handle blockId idx generation =>
+      s!"(handle {blockId.id}[{idx}] @ {generation})"
+
+instance : ToString ExprId where
+  toString u := private toString u.view
+
+@[inline]
+private def ExprIdView.toExprId : ExprIdView → ExprId
+  | .bvar idx =>
+    assert! idx + 1 < (1 <<< 20)
+    { idx := (idx.toUInt64 <<< 24) ||| exprIdBlockMask }
+  | .handle blockId idx generation =>
+    assert! blockId.id < (1 <<< 24)
+    { idx :=
+      blockId.id.toUInt64
+      ||| (idx.toUInt64 <<< 24)
+      ||| (generation.toUInt64 <<< 48) }
+
+private structure ExprBlock where
   /-- Region the block is associated to. -/
-  region : ExprRegionId
+  regionId : ExprRegionId
+  /-- Generation counter for the block. Incremented every time it is freed. -/
   generation : UInt16
-  freeIdx : UInt16
+  /-- Index to the first free slot in `exprs`. -/
+  freeIdx : Nat
   /-- Uses an `Array` for the block. Assumption: these are rarely copied. -/
   exprs : Array (Expr LevelId ExprId)
-  /-- Records hashes, as well as the `hasMVar` and `hasParam` bits. -/
+  /-- Cache of hashes of corresponding expressions. -/
   hashes : Array UInt64
 
-structure ExprRegion where
+/-- Returns true if the block has free space. -/
+private def ExprBlock.hasFree (block : ExprBlock) : Bool :=
+  block.freeIdx < 512
+
+private structure ExprRegion where
   /-- Blocks owned by this region. The first block in the list is the one
   that is currently used for new allocations. -/
   blockIds : List ExprBlockId
+  /-- The level region that levels should be allocated into for this region. -/
+  levelRegionId : LevelRegionId
+  /-- Forwarding pointers, for promoting expressions to older regions.
+  See `promoteExpr`. -/
+  forward : Std.HashMap ExprId ExprId := {}
   deriving Inhabited
 
 /--
-Context for allocating `Level` expressions.
+Context for allocating expressions.
 -/
-structure ExprContext where
+structure ExprContext where private mk ::
   /-- Array of all blocks, both those used by regions, and those in the
   `freeBlocks` list. -/
-  blocks : Lean.PersistentArray ExprBlock
+  private blocks : Lean.PersistentArray ExprBlock
   /-- Array of all allocation regions. -/
-  regions : Lean.PersistentArray ExprRegion
+  private regions : Lean.PersistentArray ExprRegion
   /-- List of blocks in `blocks` that are free. -/
-  freeBlocks : List ExprBlockId
+  private freeBlocks : List ExprBlockId
   levelContext : LevelContext
+  /-- The current allocation region. Can be modified to change where
+  expressions are being allocated. -/
+  currRegionId : ExprRegionId
 
-def ExprBlock.init : ExprBlock where
-  region := { id := 0 }
+def ExprRegionId.static : ExprRegionId := { id := 0 }
+
+private def ExprBlock.init : ExprBlock where
+  regionId := .static
   generation := 0
   freeIdx := 0
-  exprs := Array.replicate exprContextBlockSize default
-  hashes := Array.replicate exprContextBlockSize 0
+  exprs := Array.replicate 512 (.bvar 0)
+  hashes := Array.replicate 512 0
 
-instance : Inhabited ExprBlock := ⟨.init⟩
+private instance : Inhabited ExprBlock := ⟨.init⟩
 
 /--
-Creates the initial level context, reserving block 0 for `Expr.bvar`.
+Creates the initial level context with a single allocation region.
 -/
 def ExprContext.init : ExprContext where
-  blocks := List.toPArray' [ExprBlock.init, ExprBlock.init]
-  regions := List.toPArray' [{ blockIds := [{ id := 1 }, { id := 0 }] }]
+  blocks := List.toPArray' [ExprBlock.init]
+  regions :=
+    List.toPArray' [{ blockIds := [{ id := 0}], levelRegionId := .static }]
   freeBlocks := []
-  levelContext := LevelContext.init
+  levelContext := .init
+  currRegionId := .static
 
 instance : Inhabited ExprContext := ⟨.init⟩
 
-def ExprContext.getBlock (ctx : ExprContext) (bid : ExprBlockId) :
+private def ExprContext.getBlock (ctx : ExprContext) (bid : ExprBlockId) :
     ExprBlock :=
   ctx.blocks.get! bid.id
 
-def ExprContext.modifyBlock (ctx : ExprContext) (bid : ExprBlockId)
+private def ExprContext.modifyBlock (ctx : ExprContext) (bid : ExprBlockId)
     (f : ExprBlock → ExprBlock) : ExprContext :=
   { ctx with blocks := ctx.blocks.modify bid.id f }
 
-def ExprContext.getRegion (ctx : ExprContext) (rid : ExprRegionId) : ExprRegion :=
+private def ExprContext.getRegion (ctx : ExprContext) (rid : ExprRegionId) :
+    ExprRegion :=
   ctx.regions.get! rid.id
 
-def ExprContext.modifyRegion (ctx : ExprContext) (rid : ExprRegionId)
+private def ExprContext.modifyRegion (ctx : ExprContext) (rid : ExprRegionId)
     (f : ExprRegion → ExprRegion) : ExprContext :=
   { ctx with regions := ctx.regions.modify rid.id f }
 
-def ExprId.getBlockIdAndIndex (u : ExprId) :
-    ExprBlockId × Nat :=
-  let blockId := u.idx >>> exprContextBlockSizeBits.toUInt32
-  let exprIdx := u.idx &&& (exprContextBlockSize.toUInt32 - 1)
-  ({ id := blockId.toNat }, exprIdx.toNat)
-
-def ExprId.mkIdx (blockId : ExprBlockId) (index : Nat) :=
-  (blockId.id.toUInt32 <<< exprContextBlockSizeBits.toUInt32) ||| index.toUInt32
-
-def ExprContext.getBlockAndIndex (ctx : ExprContext) (u : ExprId) :
-    ExprBlock × Nat :=
-  let (blockId, exprIdx) := u.getBlockIdAndIndex
-  let block := ctx.getBlock blockId
-  assert! block.generation == u.generation
-  (block, exprIdx)
-
 def ExprContext.getRegionId (ctx : ExprContext) (u : ExprId) :
     ExprRegionId :=
-  (ctx.getBlockAndIndex u).1.region
+  match u.view with
+  | .bvar .. => .static
+  | .handle blockId .. => (ctx.getBlock blockId).regionId
 
 def ExprContext.get (ctx : ExprContext) (u : ExprId) : Expr LevelId ExprId :=
-  let (blockId, exprIdx) := u.getBlockIdAndIndex
-  if blockId.id == 0 then
-    Expr.bvar exprIdx
-  else
-    let (block, exprIdx) := ctx.getBlockAndIndex u
-    block.exprs[exprIdx]!
+  match u.view with
+  | .bvar idx => Expr.bvar idx
+  | .handle blockId idx generation =>
+    let block := ctx.getBlock blockId
+    assert! block.generation == generation
+    block.exprs[idx]!
 
 def ExprContext.getHash (ctx : ExprContext) (u : ExprId) : UInt64 :=
-  if u.idx == 0 then
-    -- Special case: idx 0 is Level.zero
-    Level.hashAddOffset 0 u.offset.toNat
-  else
-    let (block, idx) := ctx.getBlockAndIndex u
-    Level.hashAddOffset block.hashes[idx]! u.offset.toNat
-
-def ExprContext.hasParam (ctx : ExprContext) (u : ExprId) : Bool :=
-  (ctx.getHash u) &&& 1 != 0
-
-def ExprContext.hasMVar (ctx : ExprContext) (u : ExprId) : Bool :=
-  (ctx.getHash u) &&& 2 != 0
-
-/-- Gets the region at the top of the region stack. -/
-def ExprContext.currRegionId (ctx : ExprContext) : ExprRegionId :=
-  { id := ctx.regions.size - 1 }
+  match u.view with
+  | .bvar idx => Expr.hashBVar idx
+  | .handle blockId idx generation =>
+    let block := ctx.getBlock blockId
+    assert! block.generation == generation
+    block.hashes[idx]!
 
 /-- Gets the block that the region is allocating into. -/
-def ExprContext.regionCurrBlockId (ctx : ExprContext)
+private def ExprContext.regionCurrBlockId (ctx : ExprContext)
     (rid : ExprRegionId) : ExprBlockId :=
   (ctx.getRegion rid).blockIds.head!
 
 /-- Resets the free index and increments the generation counter. -/
-def ExprBlock.reset (b : ExprBlock) : ExprBlock :=
+private def ExprBlock.reset (b : ExprBlock) : ExprBlock :=
   { b with freeIdx := 0, generation := b.generation + 1 }
 
 /-- Allocates a new block, possibly by drawing it from the free list. -/
-def ExprContext.mkBlock (ctx : ExprContext) : ExprBlockId × ExprContext :=
+private def ExprContext.newBlock (ctx : ExprContext) :
+    ExprBlockId × ExprContext :=
   match ctx.freeBlocks with
   | freeBlock :: freeBlocks =>
     (freeBlock, { ctx with freeBlocks })
@@ -191,16 +227,16 @@ def ExprContext.mkBlock (ctx : ExprContext) : ExprBlockId × ExprContext :=
 Adds the block to the free list. Increments the generation counter to invalidate
 any existing handles.
 -/
-def ExprContext.freeBlock (ctx : ExprContext) (bid : ExprBlockId) :
+private def ExprContext.freeBlock (ctx : ExprContext) (bid : ExprBlockId) :
     ExprContext :=
   { ctx.modifyBlock bid ExprBlock.reset with
     freeBlocks := bid :: ctx.freeBlocks }
 
 /-- Allocates a new block for a region. -/
-def ExprContext.regionMkBlock (ctx : ExprContext) (rid : ExprRegionId) :
-    ExprBlockId × ExprContext :=
-  let (blockId, ctx) := ctx.mkBlock
-  let ctx := ctx.modifyBlock blockId fun block => { block with region := rid }
+private def ExprContext.regionNewBlock (ctx : ExprContext)
+    (rid : ExprRegionId) : ExprBlockId × ExprContext :=
+  let (blockId, ctx) := ctx.newBlock
+  let ctx := ctx.modifyBlock blockId fun block => { block with regionId := rid }
   let ctx := ctx.modifyRegion rid fun region =>
     { region with blockIds := blockId :: region.blockIds }
   (blockId, ctx)
@@ -212,91 +248,77 @@ region.
 def ExprContext.pushRegion (ctx : ExprContext) :
     ExprRegionId × ExprContext :=
   let rid : ExprRegionId := { id := ctx.regions.size }
-  let (bid, ctx) := ctx.mkBlock
-  let ctx := ctx.modifyBlock bid fun block => { block with region := rid }
-  let ctx := { ctx with regions := ctx.regions.push { blockIds := [bid] } }
+  let (bid, ctx) := ctx.newBlock
+  let ctx := ctx.modifyBlock bid fun block => { block with regionId := rid }
+  let levelRegionId := ctx.levelContext.currRegionId
+  let ctx := { ctx with
+    regions := ctx.regions.push { blockIds := [bid], levelRegionId } }
   (rid, ctx)
 
 /--
 Deallocates the last region that was created with `pushRegion`.
 All handles to levels contained within it become invalid.
+The region id must be the region being deallocated.
 -/
-def ExprContext.popRegion (ctx : ExprContext) : ExprContext :=
-  assert! ctx.regions.size > 1
+def ExprContext.popRegion (ctx : ExprContext)
+    (rid : ExprRegionId) :
+    ExprContext :=
+  assert! ctx.regions.size > 1 -- cannot free static region
+  assert! ctx.regions.size - 1 == rid.id -- rid matches region being deallocated
+  assert! ctx.regions.size - 1 != ctx.currRegionId.id -- ensure curr still valid
   let r := ctx.regions.get! (ctx.regions.size - 1)
   let ctx := { ctx with regions := ctx.regions.pop }
   let ctx := r.blockIds.foldl (init := ctx) freeBlock
   ctx
 
-/-- Returns true if the block has free space. -/
-def ExprBlock.hasFree (block : ExprBlock) : Bool :=
-  block.freeIdx.toNat < exprContextBlockSize
-
 /--
 Returns the current allocation block for the region, allocating a new
 block if the current one is full.
 -/
-def ExprContext.regionAllocBlockId (ctx : ExprContext)
+private def ExprContext.regionAllocBlockId (ctx : ExprContext)
     (rid : ExprRegionId) : ExprBlockId × ExprContext :=
   let blockId := ctx.regionCurrBlockId rid
-  let block := ctx.getBlock blockId
-  if block.hasFree then
+  if (ctx.getBlock blockId).hasFree then
     (blockId, ctx)
   else
-    ctx.regionMkBlock rid
+    ctx.regionNewBlock rid
 
-/-- Allocates a level in the given region. -/
-def ExprContext.regionMkLevelOffset (ctx : ExprContext) (rid : ExprRegionId)
-    (u : Level ExprId) (offset : Nat) : ExprId × ExprContext :=
-  if let .succ u' := u then
-    ({ u' with offset := mkOffset (offset + u'.offset.toNat + 1) }, ctx)
+/-- Allocates an expression in the given region. -/
+def ExprContext.regionMkExpr (ctx : ExprContext) (rid : ExprRegionId)
+    (u : Expr LevelId ExprId) : ExprId × ExprContext :=
+  if let .bvar idx := u then
+    (ExprId.bvar idx, ctx)
   else
-    let hash := u.hashCore 0 ctx.getHash
+    let hash := u.hashCore ctx.levelContext.getHash ctx.getHash
     let (blockId, ctx) := ctx.regionAllocBlockId rid
     let block := ctx.getBlock blockId
     assert! block.hasFree
-    let { freeIdx, generation, .. } := block
-    let index := freeIdx.toNat
+    let { freeIdx := idx, generation, .. } := block
     let ctx := ctx.modifyBlock blockId fun block =>
       { block with
         freeIdx := block.freeIdx + 1
-        levels := block.levels.set! index u
-        hashes := block.hashes.set! index hash }
-    let levelId : ExprId :=
-      { idx := ExprId.mkIdx blockId index
-        offset := mkOffset offset
-        generation }
-    (levelId, ctx)
+        exprs := block.exprs.set! idx u
+        hashes := block.hashes.set! idx hash }
+    ((ExprIdView.handle blockId idx generation).toExprId, ctx)
 
-/-- Allocates a level in the current region. -/
-def ExprContext.mkLevelOffset (ctx : ExprContext)
-    (u : Level ExprId) (offset : Nat) : ExprId × ExprContext :=
-  let rid := ctx.currRegionId
-  ctx.regionMkLevelOffset rid u offset
+/-- Allocates an expression in the current region. -/
+def ExprContext.mkExpr (ctx : ExprContext)
+    (u : Expr LevelId ExprId) : ExprId × ExprContext :=
+  ctx.regionMkExpr ctx.currRegionId u
 
-def ExprContext.mkMax (ctx : ExprContext) (u v : ExprId) :
-    ExprId × ExprContext :=
-  ctx.mkLevelOffset (Level.max u v) 0
-
-def ExprContext.mkIPos (ctx : ExprContext) (u v : ExprId) :
-    ExprId × ExprContext :=
-  ctx.mkLevelOffset (Level.ipos u v) 0
-
-def ExprContext.mkParam (ctx : ExprContext) (n : Name) :
-    ExprId × ExprContext :=
-  ctx.mkLevelOffset (Level.param n) 0
-
-def ExprContext.mkMVar (ctx : ExprContext) (mvarId : LMVarId) :
-    ExprId × ExprContext :=
-  ctx.mkLevelOffset (Level.mvar mvarId) 0
+def ExprContext.modifyGetLevelContext {α : Type}
+    (f : LevelContext → α × LevelContext) (ctx : ExprContext) :
+    α × ExprContext :=
+  let (x, levelContext) := f ctx.levelContext
+  (x, { ctx with levelContext })
 
 def ExprContext.stats (ctx : ExprContext) : String :=
   let totalLevels := ctx.blocks.foldl (init := 0) fun total block =>
-    total + block.freeIdx.toNat
+    total + block.freeIdx
   s!"ExprContext stats:\n\
   - {ctx.blocks.size} blocks ({ctx.freeBlocks.length} in free list)\n\
   - {ctx.regions.size} regions\n\
-  - {totalLevels} level expressions"
+  - {totalLevels} total expressions\n{ctx.levelContext.stats}"
 
 /--
 Class for monads that contain `ExprContext` state.
@@ -313,57 +335,81 @@ def MonadExprContext.modifyExprContext {m : Type → Type} [MonadExprContext m]
 
 export MonadExprContext (getExprContext modifyGetExprContext modifyExprContext)
 
-instance (m : Type → Type) [Monad m] [MonadExprContext m] : MonadGetLevel m ExprId where
-  getLevel u := (ExprContext.get · u) <$> getExprContext
-  getLevelOffset u := pure u.getOffset
-  levelHasMVar u := (ExprContext.hasMVar · u) <$> getExprContext
-  levelHasParam u := (ExprContext.hasParam · u) <$> getExprContext
-  levelHash u := (ExprContext.getHash · u) <$> getExprContext
+instance (m : Type → Type) [Monad m] [MonadExprContext m] : MonadLevelContext m where
+  getLevelContext := ExprContext.levelContext <$> getExprContext
+  modifyGetLevelContext f :=
+    modifyGetExprContext (ExprContext.modifyGetLevelContext f)
 
-instance (m : Type → Type) [Monad m] [MonadExprContext m] : MonadMkLevel m ExprId where
-  mkLevelZero := pure ExprId.zero
-  mkLevelSucc u := pure u.succ
-  mkLevelMax u v := modifyGetExprContext (fun ctx => ctx.mkMax u v)
-  mkLevelIPos u v := modifyGetExprContext (fun ctx => ctx.mkIPos u v)
-  mkLevelParam n := modifyGetExprContext (fun ctx => ctx.mkParam n)
-  mkLevelMVar mvarId := modifyGetExprContext (fun ctx => ctx.mkMVar mvarId)
-  mkLevelOffset u offset := pure <| u.addOffset offset
+instance (m : Type → Type) [Monad m] [MonadExprContext m] :
+    MonadGetExpr m LevelId ExprId where
+  getExpr e := (ExprContext.get · e) <$> getExprContext
+  exprHash e := (ExprContext.getHash · e) <$> getExprContext
+
+instance (m : Type → Type) [Monad m] [MonadExprContext m] :
+    MonadMkExpr m LevelId ExprId where
+  mkExprBVar idx := pure (ExprId.bvar idx)
+  mkExprFVar fvarId :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.fvar fvarId))
+  mkExprMVar mvarId :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.mvar mvarId))
+  mkExprSort u :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.sort u))
+  mkExprConst n us :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.const n us))
+  mkExprApp fn arg :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.app fn arg))
+  mkExprLam n t b i :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.lam n t b i))
+  mkExprPi n t b i :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.pi n t b i))
+  mkExprLet n t v b :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.let n t v b))
+  mkExprLit l :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.lit l))
+  mkExprProj typeName idx s :=
+    modifyGetExprContext (fun ctx => ctx.mkExpr (.proj typeName idx s))
 
 namespace ExprId
 variable {m : Type → Type} [Monad m] [MonadExprContext m]
 
-def get (u : ExprId) : m (Level ExprId) :=
-  getLevel u
+def get (e : ExprId) : m (Expr LevelId ExprId) :=
+  getExpr e
 
-def hasMVar (u : ExprId) : m Bool :=
-  MonadGetLevel.levelHasMVar u
+def hasLevelMVar (e : ExprId) : m Bool :=
+  exprHasLevelMVar e
 
-def hasParam (u : ExprId) : m Bool :=
-  MonadGetLevel.levelHasParam u
+def hasExprMVar (e : ExprId) : m Bool :=
+  exprHasExprMVar e
 
-def hash (u : ExprId) : m UInt64 :=
-  MonadGetLevel.levelHash u
+def hasMVar (e : ExprId) : m Bool :=
+  exprHasMVar e
 
-/--
-Normalizes the level. Does not instantiate metavariables.
--/
-def normalize (u : ExprId) : m ExprId :=
-  normalizeLevel u
+def hasLevelParam (e : ExprId) : m Bool :=
+  exprHasLevelParam e
+
+def hasFVar (e : ExprId) : m Bool :=
+  exprHasFVar e
+
+def looseBVarRange (e : ExprId) : m Nat :=
+  exprLooseBVarRange e
+
+def hasLooseBVars (e : ExprId) : m Bool :=
+  exprHasLooseBVars e
+
+def hash (e : ExprId) : m UInt64 :=
+  exprHash e
 
 /--
 Structural equality.
 -/
-def eq (u v : ExprId) : m Bool :=
-  levelEq u v
+def eq (e e' : ExprId) : m Bool :=
+  exprEq e e'
 
 /--
-Level equivalence.
+Structural equality, ignoring binder names and binder info.
 -/
-def equiv (u v : ExprId) : m Bool :=
-  levelEquiv u v
-
-def le (u v : ExprId) : m Bool :=
-  levelLE u v
+def equiv (e e' : ExprId) : m Bool :=
+  exprEquiv e e'
 
 end ExprId
 
@@ -371,15 +417,69 @@ section MonadExprContext
 variable {m : Type → Type} [Monad m] [MonadExprContext m]
 
 /--
-Runs `f` with a new allocation region, deallocating the region at the end.
+Temporarily sets the current expr allocation region while executing `x`.
+This also sets the current level allocation region to the one associated
+to `regionId`.
+-/
+def withSetCurrExprRegion [MonadFinally m] {α}
+    (regionId : ExprRegionId) (x : m α) : m α := do
+  let levelRegionId := ((← getExprContext).getRegion regionId).levelRegionId
+  let oldRegionId ← modifyGetExprContext (fun ctx =>
+    (ctx.currRegionId, { ctx with currRegionId := regionId }))
+  try
+    withSetCurrLevelRegion levelRegionId x
+  finally
+    modifyExprContext (fun ctx => { ctx with currRegionId := oldRegionId })
+
+/--
+Runs `f` with a new expression allocation region, deallocating the region at
+the end. Uses the current level region.
 -/
 def withNewExprRegion [MonadFinally m] {α}
     (f : ExprRegionId → m α) : m α := do
   let rid ← modifyGetExprContext (fun ctx => ctx.pushRegion)
   try
-    f rid
+    withSetCurrExprRegion rid do f rid
   finally
-    modifyExprContext (fun ctx => ctx.popRegion)
+    modifyExprContext (fun ctx => ctx.popRegion rid)
+
+/--
+Runs `f` with a new expression and level allocation regions, deallocating the
+regions at the end. The level region ID is
+-/
+def withNewLevelExprRegions [MonadFinally m] {α}
+    (f : LevelRegionId → ExprRegionId → m α) : m α := do
+  withNewLevelRegion fun lrid => do
+    withNewExprRegion fun erid => do
+      f lrid erid
+
+/--
+If `e` is in a newer region than the current region, copies it into the current
+region, returning the copied expression.
+
+This is intended to be used with `withSetCurrExprRegion`, and it is like a
+tracing garbage collection step before returning from `withNewExprRegion`.
+-/
+partial def promoteExpr (e : ExprId) : m ExprId := do
+  match e.view with
+  | .bvar .. => return e
+  | .handle blockId _ generation =>
+    let ctx ← getExprContext
+    let block := ctx.getBlock blockId
+    assert! block.generation == generation
+    let rid := block.regionId
+    if rid.id ≤ ctx.currRegionId.id then
+      return e
+    else
+      let region := ctx.getRegion rid
+      if let some e' := region.forward[e]? then
+        promoteExpr e'
+      else
+        let e' ← (← e.get).mapM promoteLevel (fun e _ => promoteExpr e)  0
+        let e' ← modifyGetExprContext fun ctx => ctx.mkExpr e'
+        modifyExprContext fun ctx => ctx.modifyRegion rid fun region =>
+          { region with forward := region.forward.insert e e' }
+        return e'
 
 end MonadExprContext
 

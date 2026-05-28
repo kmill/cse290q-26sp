@@ -34,15 +34,18 @@ info: u = max (ipos (u + 1) (max (ipos (v + 1) w) w)) (ipos (v + 1) w) w
 info: normalized: max (ipos (u + 1) w) (ipos (v + 1) w) w
 ---
 info: LevelContext stats:
-- 1 blocks (0 in free list)
+- 2 blocks (1 in free list)
 - 1 regions
-- 12 level expressions
+- 7 total level expressions
 -/
 #guard_msgs in
 #eval runM do
-  let u ← mkLevelExpr1
-  Lean.logInfo m!"u = {← ppLevel u}"
-  let u ← u.normalize
+  let u ← withNewLevelRegion fun _ => do
+    let u ← mkLevelExpr1
+    Lean.logInfo m!"u = {← ppLevel u}"
+    let v ← u.normalize
+    withSetCurrLevelRegion LevelRegionId.static do
+      promoteLevel v
   Lean.logInfo m!"normalized: {← ppLevel u}"
   logStats
 
@@ -59,7 +62,7 @@ info: u = max 4 (u + 3), normalized = max (u + 3) 4
 info: LevelContext stats:
 - 1 blocks (0 in free list)
 - 1 regions
-- 8 level expressions
+- 7 total level expressions
 -/
 #guard_msgs in
 #eval runM do
@@ -69,4 +72,25 @@ info: LevelContext stats:
   Lean.logInfo m!"u = {← ppLevel u}, normalized = {← ppLevel (← u.normalize)}"
   let u ← mkLevelExpr2 4
   Lean.logInfo m!"u = {← ppLevel u}, normalized = {← ppLevel (← u.normalize)}"
+  logStats
+
+/--
+info: u = max 2 (u + 3), normalized = u + 3
+---
+info: LevelContext stats:
+- 2 blocks (0 in free list)
+- 2 regions
+- 2 total level expressions
+---
+info: LevelContext stats:
+- 2 blocks (1 in free list)
+- 1 regions
+- 0 total level expressions
+-/
+#guard_msgs in
+#eval runM do
+  withNewLevelRegion fun _ => do
+    let u ← mkLevelExpr2 2
+    Lean.logInfo m!"u = {← ppLevel u}, normalized = {← ppLevel (← u.normalize)}"
+    logStats
   logStats
