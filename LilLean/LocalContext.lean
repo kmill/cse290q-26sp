@@ -242,29 +242,30 @@ def subcontextOf (lctx lctx' : LocalContext)
 section MkBinding
 variable {m : Type → Type} [Monad m] [MonadExprContext m]
 
-def mkBinding (kind : BindingKind) (lctx : LocalContext) (xs : Array FVarId) (b : ExprId)
-    (usedLetOnly : Bool := true) : m ExprId := do
+/--
+Low-level function for creating lambdas, pi types, and let expressions.
+Does not abstract fvars from metavariables, nor does it instantiate
+metavariables, neither in `b` nor in the local context.
+
+If `usedLetOnly` is true (the default), then unused lets are eliminated.
+-/
+def mkBinding (lctx : LocalContext) (kind : BindingKind)
+    (xs : Array FVarId) (b : ExprId) (usedLetOnly : Bool := true) :
+    m ExprId := do
   let b ← exprAbstractFVarRev b xs
-  xs.size.foldRevM (init := b) fun i _ b => do
-    let x := xs[i]
-    let handleCDecl (n : Name) (ty : ExprId) (bi : BinderInfo) : ExprId :=
-      let ty := ty.abstractRange i xs;
-      if isLambda then
-        Lean.mkLambda n bi ty b
-      else
-        Lean.mkForall n bi ty b
+  xs.size.foldRevM (init := b) fun j _ b => do
+    let x := xs[j]
     match lctx.find? x with
-    | some (.cdecl _ _ n t b)  =>
-      handleCDecl n ty bi
-    | some (.ldecl _ _ n ty val nondep _) =>
-      if nondep && generalizeNondepLet then
-        handleCDecl n ty .default
-      else if !usedLetOnly || b.hasLooseBVar 0 then
-        let ty  := ty.abstractRange i xs
-        let val := val.abstractRange i xs
-        mkLet n ty val b nondep
+    | some (.cdecl _ _ n t i) =>
+      let t ← exprAbstractFVarRev t xs (endIdx := j)
+      kind.mk n t b i
+    | some (.ldecl _ _ n t v) =>
+      if ← pure (!usedLetOnly) <||> exprHasLooseBVarEq b 0 then
+        let t ← exprAbstractFVarRev t xs (endIdx := j)
+        let v ← exprAbstractFVarRev v xs (endIdx := j)
+        mkExprLet n t v b
       else
-        b.lowerLooseBVars 1 1
+        exprLiftLooseBVars b 1 (-1)
     | none => panic! "unknown free variable"
 
 end MkBinding

@@ -457,11 +457,18 @@ def exprInstantiateRev (e : ε) (xs : Array ε) : m ε := do
         | _ => return none -- continue with children subexpressions
 
 /--
-Replaces fvars in `xs` with loose bvars, where the last element of `xs`
-gets `bvar 0`. Pre-existing loose bvars are *not* modified.
+Replaces fvars in `xs[beginIdx...endIdx]` with loose bvars, where the last
+element of the subarray gets `bvar 0`.
+
+Note: like in Lean 4, pre-existing loose bvars are *not* modified.
 -/
-def exprAbstractFVarRev (e : ε) (xs : Array FVarId) (start := 0) (end := 0) : m ε := do
-  if xs.isEmpty then
+def exprAbstractFVarRev (e : ε) (xs : Array FVarId)
+    (beginIdx := 0) (endIdx := xs.size) :
+    m ε := do
+  if beginIdx ≥ endIdx then
+    return e
+  else if h : endIdx > xs.size then
+    panic! "exprAbstractFVarRev: endIdx out of bounds"
     return e
   else if !(← exprHasFVar e) then
     return e
@@ -473,13 +480,109 @@ def exprAbstractFVarRev (e : ε) (xs : Array FVarId) (start := 0) (end := 0) : m
       else
         match (← getExpr e) with
         | .fvar fvarId =>
-          if let some i := xs.idxOf? fvarId then
-            some <$> mkExprBVar (depth + (xs.size - i - 1))
-          else
-            return some e
+          for h : i in [beginIdx:endIdx] do
+            have : i < endIdx := by get_elem_tactic
+            have : i < xs.size := by grind
+            if xs[i] == fvarId then
+              return ← some <$> mkExprBVar (depth + (endIdx - i - 1))
+          return some e
         | _ => return none -- continue with children subexpressions
 
 end InstantiateAbstract
+
+section Find
+variable [MonadGetExpr m ℓ ε] [BEq ε] [Hashable ε]
+
+partial def exprFind? (e : ε) (p : ε → m Bool) : m (Option ε) := do
+  go e |>.run' {}
+where
+  go (e : ε) : StateT (Std.HashSet ε) m (Option ε) := do
+    if (← get).contains e then
+      return none
+    else
+      modify fun s => s.insert e
+      if ← p e then
+        return some e
+      else
+        match (← getExpr e) with
+        | .bvar _ => return none
+        | .fvar _ => return none
+        | .mvar _ => return none
+        | .sort _ => return none
+        | .const _ _ => return none
+        | .app fn arg => go fn <||> go arg
+        | .lam _ t b _ => go t <||> go b
+        | .pi _ t b _ => go t <||> go b
+        | .let _ t v b => go t <||> go v <||> go b
+        | .lit _ => return none
+        | .proj _ _ s => go s
+
+/--
+Returns true if there is a loose bvar with index `i`.
+This is not a constant time operation.
+-/
+partial def exprHasLooseBVarEq (e : ε) (i : Nat) : m Bool := do
+  if (← exprLooseBVarRange e) ≤ i then
+    return false
+  else
+    go e i |>.run' {}
+where
+  go (e : ε) (i : Nat) : StateT (Std.HashSet (ε × Nat)) m Bool := do
+    if (← exprLooseBVarRange e) ≤ i then
+      return false
+    else if (← get).contains (e, i) then
+      return false
+    else
+      modify fun s => s.insert (e, i)
+      match (← getExpr e) with
+      | .bvar idx => return idx == i
+      | .fvar _ => return false
+      | .mvar _ => return false
+      | .sort _ => return false
+      | .const _ _ => return false
+      | .app fn arg => go fn i <||> go arg i
+      | .lam _ t b _ => go t i <||> go b (i + 1)
+      | .pi _ t b _ => go t i <||> go b (i + 1)
+      | .let _ t v b => go t i <||> go v i <||> go b (i + 1)
+      | .lit _ => return false
+      | .proj _ _ s => go s i
+
+/--
+Creates a bitmap `b` of loose bvars up to but not including index `range`.
+This means that `b` has bit `i` set iff `i < range` and it is the index of
+a loose bvar.
+
+Using `range = exprLooseBVarRange e` gives the full bitmap.
+-/
+partial def exprHasLooseBVarBitmap (e : ε) (range : Nat) : m Nat := do
+  if !(← exprHasLooseBVars e) then
+    return 0
+  else
+    go e 0 |>.run' {}
+where
+  go (e : ε) (depth : Nat) : StateT (Std.HashMap (ε × Nat) Nat) m Nat := do
+    if (← exprLooseBVarRange e) ≤ depth then
+      return 0
+    else if let some b := (← get)[(e, depth)]? then
+      return b
+    else
+      let b ←
+        match (← getExpr e) with
+        | .bvar idx => pure <| if idx < depth + range then (1 <<< (idx - depth)) else 0
+        | .fvar _ => pure 0
+        | .mvar _ => pure 0
+        | .sort _ => pure 0
+        | .const _ _ => pure 0
+        | .app fn arg => (· ||| ·) <$> go fn depth <*> go arg depth
+        | .lam _ t b _ => (· ||| ·) <$> go t depth <*> go b (depth + 1)
+        | .pi _ t b _ => (· ||| ·) <$> go t depth <*> go b (depth + 1)
+        | .let _ t v b => (· ||| · ||| ·) <$> go t depth <*> go v depth <*> go b (depth + 1)
+        | .lit _ => pure 0
+        | .proj _ _ s => go s depth
+      modify fun s => s.insert (e, depth) b
+      return b
+
+end Find
 
 end
 

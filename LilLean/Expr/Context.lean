@@ -118,7 +118,10 @@ private structure ExprRegion where
   /-- Blocks owned by this region. The first block in the list is the one
   that is currently used for new allocations. -/
   blockIds : List ExprBlockId
-  /-- The level region that levels should be allocated into for this region. -/
+  /-- The level region that levels should be allocated into for this region.
+  Invariant: This expression region may have handles into `levelRegionId`` or
+  older, not newer. Invariant: level regions from older to newer expression
+  regions must be nondecreasing. -/
   levelRegionId : LevelRegionId
   /-- Forwarding pointers, for promoting expressions to older regions.
   See `promoteExpr`. -/
@@ -243,7 +246,7 @@ private def ExprContext.regionNewBlock (ctx : ExprContext)
 
 /--
 Creates a new allocation region. By default, new allocations go into this
-region.
+region. Captures the curent level region.
 -/
 def ExprContext.pushRegion (ctx : ExprContext) :
     ExprRegionId × ExprContext :=
@@ -251,6 +254,7 @@ def ExprContext.pushRegion (ctx : ExprContext) :
   let (bid, ctx) := ctx.newBlock
   let ctx := ctx.modifyBlock bid fun block => { block with regionId := rid }
   let levelRegionId := ctx.levelContext.currRegionId
+  assert! (compare (ctx.getRegion ctx.currRegionId).levelRegionId levelRegionId).isLE
   let ctx := { ctx with
     regions := ctx.regions.push { blockIds := [bid], levelRegionId } }
   (rid, ctx)

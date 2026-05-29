@@ -74,7 +74,7 @@ ID for a region in the `LevelContext`.
 -/
 structure LevelRegionId where private mk ::
   private id : Nat
-  deriving Inhabited
+  deriving Inhabited, Ord
 
 private inductive LevelIdView where
   | zero (offset : Nat)
