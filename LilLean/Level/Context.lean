@@ -73,8 +73,14 @@ private structure LevelBlockId where
 ID for a region in the `LevelContext`.
 -/
 structure LevelRegionId where private mk ::
-  private id : Nat
-  deriving Inhabited, Ord
+  /-- Unique id -/
+  private uid : Nat
+  /-- Index into the `LevelContext.regions` array -/
+  private idx : Nat
+  deriving Inhabited
+
+instance : Ord LevelRegionId where
+  compare := private fun r1 r2 => compare r1.uid r2.uid
 
 private inductive LevelIdView where
   | zero (offset : Nat)
@@ -145,6 +151,7 @@ private def LevelBlock.hasFree (block : LevelBlock) : Bool :=
   block.freeIdx < 256
 
 private structure LevelRegion where
+  regionId : LevelRegionId
   /-- Blocks owned by this region. The first block in the list is the one
   that is currently used for new allocations. -/
   blockIds : List LevelBlockId
@@ -164,11 +171,12 @@ structure LevelContext where private mk ::
   private regions : Lean.PersistentArray LevelRegion
   /-- List of blocks in `blocks` that are free. -/
   private freeBlocks : List LevelBlockId
+  nextRegionUId : Nat := 1
   /-- The current allocation region. Can be modified to change where levels
   are being allocated. -/
   currRegionId : LevelRegionId
 
-def LevelRegionId.static : LevelRegionId := { id := 0 }
+def LevelRegionId.static : LevelRegionId := { uid := 0, idx := 0 }
 
 private def LevelBlock.init : LevelBlock where
   regionId := .static
@@ -184,7 +192,7 @@ Creates the initial level context with a single allocation region.
 -/
 def LevelContext.init : LevelContext where
   blocks := List.toPArray' [LevelBlock.init]
-  regions := List.toPArray' [{ blockIds := [{ id := 0}] }]
+  regions := List.toPArray' [{ regionId := .static, blockIds := [{ id := 0}] }]
   freeBlocks := []
   currRegionId := .static
 
@@ -200,11 +208,13 @@ private def LevelContext.modifyBlock (ctx : LevelContext) (bid : LevelBlockId)
 
 private def LevelContext.getRegion (ctx : LevelContext) (rid : LevelRegionId) :
     LevelRegion :=
-  ctx.regions.get! rid.id
+  let region := ctx.regions.get! rid.idx
+  assert! region.regionId.uid == rid.uid
+  region
 
 private def LevelContext.modifyRegion (ctx : LevelContext) (rid : LevelRegionId)
     (f : LevelRegion → LevelRegion) : LevelContext :=
-  { ctx with regions := ctx.regions.modify rid.id f }
+  { ctx with regions := ctx.regions.modify rid.idx f }
 
 def LevelContext.getRegionId (ctx : LevelContext) (u : LevelId) :
     LevelRegionId :=
@@ -274,17 +284,23 @@ private def LevelContext.regionNewBlock (ctx : LevelContext)
     { region with blockIds := blockId :: region.blockIds }
   (blockId, ctx)
 
+private def LevelContext.newRegionId (ctx : LevelContext) :
+    LevelRegionId × LevelContext :=
+  let uid := ctx.nextRegionUId
+  ({ uid, idx := ctx.regions.size }, { ctx with nextRegionUId := uid + 1 })
+
 /--
 Creates a new allocation region. By default, new allocations go into this
 region.
 -/
 def LevelContext.pushRegion (ctx : LevelContext) :
     LevelRegionId × LevelContext :=
-  let rid : LevelRegionId := { id := ctx.regions.size }
+  let (regionId, ctx) := ctx.newRegionId
   let (bid, ctx) := ctx.newBlock
-  let ctx := ctx.modifyBlock bid fun block => { block with regionId := rid }
-  let ctx := { ctx with regions := ctx.regions.push { blockIds := [bid] } }
-  (rid, ctx)
+  let ctx := ctx.modifyBlock bid fun block => { block with regionId }
+  let ctx := { ctx with
+    regions := ctx.regions.push { regionId, blockIds := [bid] } }
+  (regionId, ctx)
 
 /--
 Deallocates the last region that was created with `pushRegion`.
@@ -295,9 +311,9 @@ def LevelContext.popRegion (ctx : LevelContext)
     (rid : LevelRegionId) :
     LevelContext :=
   assert! ctx.regions.size > 1 -- cannot free static region
-  assert! ctx.regions.size - 1 == rid.id -- rid matches region being deallocated
-  assert! ctx.regions.size - 1 != ctx.currRegionId.id -- ensure curr still valid
+  assert! (compare ctx.currRegionId rid).isLT -- ensure curr still will be valid
   let r := ctx.regions.get! (ctx.regions.size - 1)
+  assert! (compare r.regionId rid).isEq
   let ctx := { ctx with regions := ctx.regions.pop }
   let ctx := r.blockIds.foldl (init := ctx) freeBlock
   ctx
@@ -317,11 +333,10 @@ private def LevelContext.regionAllocBlockId (ctx : LevelContext)
 /-- Allocates a level in the given region. -/
 def LevelContext.regionMkLevel (ctx : LevelContext) (rid : LevelRegionId)
     (u : Level LevelId) : LevelId × LevelContext :=
-  if let .zero := u then
-    (LevelId.zero, ctx)
-  else if let .offset u' c := u then
-    (u'.addOffset c, ctx)
-  else
+  match u with
+  | .zero => (LevelId.zero, ctx)
+  | .offset u' c => (u'.addOffset c, ctx)
+  | _ =>
     let hash := u.hashCore ctx.getHash
     let (blockId, ctx) := ctx.regionAllocBlockId rid
     let block := ctx.getBlock blockId
@@ -341,22 +356,6 @@ def LevelContext.mkLevel (ctx : LevelContext)
     (u : Level LevelId) : LevelId × LevelContext :=
   ctx.regionMkLevel ctx.currRegionId u
 
-def LevelContext.mkMax (ctx : LevelContext) (u v : LevelId) :
-    LevelId × LevelContext :=
-  ctx.mkLevel (Level.max u v)
-
-def LevelContext.mkIPos (ctx : LevelContext) (u v : LevelId) :
-    LevelId × LevelContext :=
-  ctx.mkLevel (Level.ipos u v)
-
-def LevelContext.mkParam (ctx : LevelContext) (n : Name) :
-    LevelId × LevelContext :=
-  ctx.mkLevel (Level.param n)
-
-def LevelContext.mkMVar (ctx : LevelContext) (mvarId : LMVarId) :
-    LevelId × LevelContext :=
-  ctx.mkLevel (Level.mvar mvarId)
-
 def LevelContext.stats (ctx : LevelContext) : String :=
   let totalLevels := ctx.blocks.foldl (init := 0) fun total block =>
     total + block.freeIdx
@@ -364,6 +363,11 @@ def LevelContext.stats (ctx : LevelContext) : String :=
   - {ctx.blocks.size} blocks ({ctx.freeBlocks.length} in free list)\n\
   - {ctx.regions.size} regions\n\
   - {totalLevels} total level expressions"
+
+@[inline] def LevelContext.levelGetter (ctx : LevelContext) :
+    LevelGetter LevelId where
+  get := ctx.get
+  hash := ctx.getHash
 
 /--
 Class for monads that contain `LevelContext` state.
@@ -378,19 +382,16 @@ def MonadLevelContext.modifyLevelContext {m : Type → Type} [MonadLevelContext 
     (f : LevelContext → LevelContext) : m Unit :=
   modifyGetLevelContext fun ctx => ((), f ctx)
 
-export MonadLevelContext (getLevelContext modifyGetLevelContext modifyLevelContext)
+export MonadLevelContext
+  (getLevelContext modifyGetLevelContext modifyLevelContext)
 
-instance (m : Type → Type) [Monad m] [MonadLevelContext m] : MonadGetLevel m LevelId where
-  getLevel u := (LevelContext.get · u) <$> getLevelContext
-  levelHash u := (LevelContext.getHash · u) <$> getLevelContext
+instance (m : Type → Type) [Monad m] [MonadLevelContext m] :
+    MonadGetLevel m LevelId where
+  getLevelGetter := LevelContext.levelGetter <$> getLevelContext
 
-instance (m : Type → Type) [Monad m] [MonadLevelContext m] : MonadMkLevel m LevelId where
-  mkLevelZero := pure LevelId.zero
-  mkLevelOffset u offset := pure <| u.addOffset offset
-  mkLevelMax u v := modifyGetLevelContext (fun ctx => ctx.mkMax u v)
-  mkLevelIPos u v := modifyGetLevelContext (fun ctx => ctx.mkIPos u v)
-  mkLevelParam n := modifyGetLevelContext (fun ctx => ctx.mkParam n)
-  mkLevelMVar mvarId := modifyGetLevelContext (fun ctx => ctx.mkMVar mvarId)
+instance (m : Type → Type) [Monad m] [MonadLevelContext m] :
+    MonadMkLevel m LevelId where
+  mkLevel u := modifyGetLevelContext (fun ctx => ctx.mkLevel u)
 
 namespace LevelId
 variable {m : Type → Type} [Monad m] [MonadLevelContext m]
@@ -430,6 +431,48 @@ def le (u v : LevelId) : m Bool :=
 
 end LevelId
 
+/-- Monad for doing `LevelContext` manipulations. -/
+abbrev LevelContext.M := StateM LevelContext
+
+instance : MonadLevelContext LevelContext.M where
+  getLevelContext := get
+  modifyGetLevelContext := modifyGet
+
+section Promote
+
+partial def promoteLevelCore (u : LevelId) : LevelContext.M LevelId := do
+  match u.view with
+  | .zero .. => return u
+  | .handle blockId idx offset generation =>
+    let ctx ← getLevelContext
+    let block := ctx.getBlock blockId
+    assert! block.generation == generation
+    let rid := block.regionId
+    if (compare rid ctx.currRegionId).isLE then
+      return u
+    else
+      let u' := (LevelIdView.handle blockId idx 0 generation).toLevelId
+      if let some u'' := (ctx.getRegion rid).forward[u']? then
+        (LevelId.addOffset · offset) <$> promoteLevelCore u''
+      else
+        let u'' ← mkLevel =<< (← u'.get).mapM promoteLevelCore
+        modifyLevelContext fun ctx => ctx.modifyRegion rid fun region =>
+          { region with forward := region.forward.insert u' u'' }
+        return LevelId.addOffset u'' offset
+
+/--
+If `u` is in a newer region than the current region, copies it into the current
+region, returning the copied level.
+
+This is intended to be used with `withSetCurrLevelRegion`, and it is like a
+tracing garbage collection step before returning from `withNewLevelRegion`.
+-/
+partial def promoteLevel {m : Type → Type} [MonadLevelContext m]
+    (u : LevelId) : m LevelId :=
+  modifyGetLevelContext <| (promoteLevelCore u).run
+
+end Promote
+
 section MonadLevelContext
 variable {m : Type → Type} [Monad m] [MonadLevelContext m]
 
@@ -455,35 +498,6 @@ def withNewLevelRegion [MonadFinally m] {α}
     withSetCurrLevelRegion rid do f rid
   finally
     modifyLevelContext (fun ctx => ctx.popRegion rid)
-
-/--
-If `u` is in a newer region than the current region, copies it into the current
-region, returning the copied level.
-
-This is intended to be used with `withSetCurrLevelRegion`, and it is like a
-tracing garbage collection step before returning from `withNewLevelRegion`.
--/
-partial def promoteLevel (u : LevelId) : m LevelId := do
-  match u.view with
-  | .zero .. => return u
-  | .handle blockId idx offset generation =>
-    let ctx ← getLevelContext
-    let block := ctx.getBlock blockId
-    assert! block.generation == generation
-    let rid := block.regionId
-    if rid.id ≤ ctx.currRegionId.id then
-      return u
-    else
-      let region := ctx.getRegion rid
-      let u' := LevelIdView.toLevelId (.handle blockId idx 0 generation)
-      if let some u'' := region.forward[u']? then
-        (LevelId.addOffset · offset) <$> promoteLevel u''
-      else
-        let u'' ← (← u'.get).mapM promoteLevel
-        let u'' ← modifyGetLevelContext fun ctx => ctx.mkLevel u''
-        modifyLevelContext fun ctx => ctx.modifyRegion rid fun region =>
-          { region with forward := region.forward.insert u' u'' }
-        return LevelId.addOffset u'' offset
 
 end MonadLevelContext
 

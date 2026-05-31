@@ -37,8 +37,8 @@ the `ℓ` type parameter, which represents a handle to a `Level`.
 
 Note: One can make a recursive version of this type using
 ```
-structure Level' where
-  level : Level Level'
+structure LevelR where
+  level : Level LevelR
 ```
 -/
 inductive Level (ℓ : Type) where
@@ -65,52 +65,73 @@ inductive Level (ℓ : Type) where
   deriving Inhabited
 
 /--
-Monad for traversing level expressions.
-The handle type `ℓ` is determined by the monad `m`.
+Object packaging up the level context state, making it possible to create
+a non-monadic interface for traversing level expressions.
+
+The `Level'` type includes a `LevelGetter` as an inductive type parameter.
+
+Normally an object like this is represented as a `class`
 -/
-class MonadGetLevel (m : Type → Type) (ℓ : outParam Type) where
-  /-- Gets the level referred to by the handle `ℓ`. -/
-  getLevel (u : ℓ) : m (Level ℓ)
+structure LevelGetter (ℓ : Type) where
+  /--
+  Gets the level referred to by the handle `ℓ`.
+  Returns `Level.zero` for invalid handles, and may panic.
+  Should not return `Level.level`.
+  -/
+  get : ℓ → Level ℓ
   /--
   Returns a hash of the level, using `Level.hashCore`. Additionally,
   - Bit 0 is 1 iff the level has a `param`.
   - Bit 1 is 1 iff the level has an `mvar`.
   -/
-  levelHash (u : ℓ) : m UInt64
+  hash : ℓ → UInt64
 
-export MonadGetLevel (getLevel levelHash)
+/--
+Monad for traversing level expressions.
+The handle type `ℓ` is determined by the monad `m`.
+-/
+class MonadGetLevel (m : Type → Type) (ℓ : outParam Type) where
+  getLevelGetter : m (LevelGetter ℓ)
+
+export MonadGetLevel (getLevelGetter)
+
+def getLevel {ℓ m} [Monad m] [MonadGetLevel m ℓ] (u : ℓ) : m (Level ℓ) :=
+  return (← getLevelGetter).get u
+
+def levelHash {ℓ m} [Monad m] [MonadGetLevel m ℓ] (u : ℓ) : m UInt64 :=
+  return (← getLevelGetter).hash u
+
+/--
+Level handle that provides a functional interface to traverse its structure.
+The `BEq` instance on this type computes *structural* `Level` equality,
+rather than mere handle equality.
+
+The `LevelGetter` is in the type itself as an inductive type parameter.
+This is a way to conveniently thread this state through computations.
+One can think of it as encoding a specific heap state in the type itself.
+
+Be careful to avoid keeping references to a `Level'`, since it creates
+non-linear uses of the underlying memory. E.g. the old `LevelContext` will
+persist, and `LevelContext.mkLevel` will result in allocating new copies of
+existing `LevelBlock`s. It's not a matter of correctness, just performance.
+-/
+structure Level' {ℓ : Type} (ctx : LevelGetter ℓ) where
+  handle : ℓ
 
 /--
 Monad for constructing level expressions.
 The handle type `ℓ` is determined by the monad `m`.
 -/
 class MonadMkLevel (m : Type → Type) (ℓ : outParam Type) where
-  /-- Makes `Level.zero`. -/
-  mkLevelZero : m ℓ
-  /-- `mkLevelOffset u n` makes `Level.offset u n`. Returns `u` if `n = 0`. -/
-  mkLevelOffset : ℓ → Nat → m ℓ
-  /-- Makes `Level.max u v`. -/
-  mkLevelMax : ℓ → ℓ → m ℓ
-  /-- Makes `Level.ipos u v`. This represents `if v > 0 then u else 0`. -/
-  mkLevelIPos : ℓ → ℓ → m ℓ
-  /-- Makes `Level.param n`. -/
-  mkLevelParam : Name → m ℓ
-  /-- Makes `Level.mvar mvarId`. -/
-  mkLevelMVar : LMVarId → m ℓ
+  /-- Constructs a handle for the level expression. -/
+  mkLevel : Level ℓ → m ℓ
 
-export MonadMkLevel
-  (mkLevelZero mkLevelMax mkLevelIPos mkLevelParam mkLevelMVar mkLevelOffset)
+export MonadMkLevel (mkLevel)
 
 instance (ℓ m n) [MonadLift m n] [MonadGetLevel m ℓ] : MonadGetLevel n ℓ where
-  getLevel u := liftM (getLevel u : m _)
-  levelHash u := liftM (levelHash u : m _)
+  getLevelGetter := liftM (getLevelGetter : m _)
 
 instance (ℓ m n) [MonadLift m n] [MonadMkLevel m ℓ] : MonadMkLevel n ℓ where
-  mkLevelZero := liftM (mkLevelZero : m _)
-  mkLevelOffset u n := liftM (mkLevelOffset u n : m _)
-  mkLevelMax u v := liftM (mkLevelMax u v : m _)
-  mkLevelIPos u v := liftM (mkLevelIPos u v : m _)
-  mkLevelParam n := liftM (mkLevelParam n : m _)
-  mkLevelMVar mvarId := liftM (mkLevelMVar mvarId : m _)
+  mkLevel u := liftM (mkLevel u : m _)
 
 end LilLean

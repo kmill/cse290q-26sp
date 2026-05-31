@@ -59,7 +59,7 @@ def Level.hashCore (u : Level ℓ) (getHash : ℓ → UInt64) : UInt64 :=
     let hm := hash mvarId
     mkHash (mixHash 7 hm) 2 -- set bit 1
 
-/-- Specialization of `Level.hashCore` for hashing a constant level. -/
+/-- Specialization of `Level.hashCore` to hashing a constant level. -/
 def Level.hashConst (c : Nat) : UInt64 :=
   if c == 0 then
     0
@@ -70,102 +70,182 @@ def Level.isZero : Level ℓ → Bool
   | .zero => true
   | _ => false
 
-section
-variable {m : Type → Type} [Monad m]
-
 /--
-Applies `f` to (non-recursively) update handles.
+Applies `f` to (non-recursively) modify handles.
 -/
-def Level.mapM (f : ℓ → m ℓ) (u : Level ℓ) : m (Level ℓ) := do
+def Level.map {ℓ ℓ'} (f : ℓ → ℓ') (u : Level ℓ) : Level ℓ' :=
   match u with
-  | .zero => return u
-  | .offset v n => return .offset (← f v) n
-  | .max v w => return .max (← f v) (← f w)
-  | .ipos v w => return .ipos (← f v) (← f w)
-  | .param _ => return u
-  | .mvar _ => return u
+  | .zero => .zero
+  | .offset v n => .offset (f v) n
+  | .max v w => .max (f v) (f w)
+  | .ipos v w => .ipos (f v) (f w)
+  | .param n => .param n
+  | .mvar mvarId => .mvar mvarId
 
-section
-variable [MonadGetLevel m ℓ]
+instance : Functor Level where
+  map := Level.map
 
-/--
-Returns whether or not the level contains a metavariable.
-Note: Even if the metavariables might be assigned with respect to the current
-metavariable context, this will still return true.
--/
-def levelHasMVar (u : ℓ) : m Bool := do
-  return (← levelHash u) &&& 2 > 0
+def LevelGetter.mkHandle (ctx : LevelGetter ℓ) (u : ℓ) : Level' ctx :=
+  { handle := u }
 
-/--
-Returns whether or not the level contains a parameter.
--/
-def levelHasParam (u : ℓ) : m Bool := do
-  return (← levelHash u) &&& 1 > 0
+namespace Level'
+variable {ctx : LevelGetter ℓ}
+
+def get (u : Level' ctx) : Level (Level' ctx) :=
+  ctx.mkHandle <$> (ctx.get u.handle)
+
+def hash (u : Level' ctx) : UInt64 := ctx.hash u.handle
 
 /--
-Returns whether or not the level is exactly `Level.zero`.
+Returns true if the level contains a parameter.
 -/
-def isLevelZero (u : ℓ) : m Bool :=
-  return (← getLevel u).isZero
+def hasParam (u : Level' ctx) : Bool := ctx.hash u.handle &&& 1 > 0
+
+/--
+Returns true if the level contains a metavariable.
+(Note: true even if the metavariable is assigned.)
+-/
+def hasMVar (u : Level' ctx) : Bool := ctx.hash u.handle &&& 2 > 0
+
+/--
+Returns true if the level is exactly `Level.zero`.
+-/
+def isZero (u : Level' ctx) : Bool := u.get.isZero
 
 /--
 Follows `Level.offset` and returns a non-`offset` level plus the total offset.
 -/
-partial def getLevelOffset (u : ℓ) : m (ℓ × Nat) :=
+partial def getOffset (u : Level' ctx) : Level' ctx × Nat :=
   go u 0
 where
-  go (u : ℓ) (c : Nat) : m (ℓ × Nat) := do
-    match (← getLevel u) with
+  go (u : Level' ctx) (c : Nat) : Level' ctx × Nat :=
+    match u.get with
     | .offset u' c' => go u' (c + c')
-    | _ => return (u, c)
+    | _ => (u, c)
 
 /--
 Returns `true` if `u` is equivalent to zero, for all assignments to
 metavariables and parameters.
 -/
-partial def isLevelAlwaysZero (u : ℓ) : m Bool := do
-  match (← getLevel u) with
-  | .zero => return true
-  | .offset v n => pure (n == 0) <&&> isLevelAlwaysZero v
-  | .max v w => isLevelAlwaysZero v <&&> isLevelAlwaysZero w
-  | .ipos v w => isLevelAlwaysZero v <||> isLevelAlwaysZero w
-  | .param _ => return false
-  | .mvar _ => return false
+partial def isAlwaysZero (u : Level' ctx) : Bool :=
+  match u.get with
+  | .zero => true
+  | .offset v n => n == 0 && isAlwaysZero v
+  | .max v w => isAlwaysZero v && isAlwaysZero w
+  | .ipos v w => isAlwaysZero v || isAlwaysZero w
+  | .param _ => false
+  | .mvar _ => false
 
 /--
 Returns `true` if `u` is not equivalent to zero, for all assignments to
 metavariables and parameters.
 -/
-partial def isLevelNeverZero (u : ℓ) : m Bool := do
-  match (← getLevel u) with
-  | .zero => return false
-  | .offset v n => pure (n > 0) <||> isLevelNeverZero v
-  | .max v w => isLevelNeverZero v <||> isLevelNeverZero w
-  | .ipos v w => isLevelNeverZero v <&&> isLevelNeverZero w
-  | .param _ => return false
-  | .mvar _ => return false
+partial def isNeverZero (u : Level' ctx) : Bool :=
+  match u.get with
+  | .zero => false
+  | .offset v n => n > 0 || isNeverZero v
+  | .max v w => isNeverZero v || isNeverZero w
+  | .ipos v w => isNeverZero v && isNeverZero w
+  | .param _ => false
+  | .mvar _ => false
 
 /--
 Returns `true` if `u` and `v` are structurally equal.
+This implements the `BEq` instance for `Level'`.
+-/
+protected partial def eq [BEq ℓ] (u v : Level' ctx) : Bool :=
+  if u.handle == v.handle then
+    true
+  else if u.hash != v.hash then
+    false
+  else
+    match u.get, v.get with
+    | .zero, .zero => true
+    | .offset ua un, .offset va vn => un == vn && ua.eq va
+    | .max ua ub, .max va vb => ua.eq va && ub.eq vb
+    | .ipos ua ub, .ipos va vb => ua.eq va && ub.eq vb
+    | .param un, .param vn => un == vn
+    | .mvar uMVarId, .mvar vMVarId => uMVarId == vMVarId
+    | _, _ => false
+
+instance [BEq ℓ] : BEq (Level' ctx) where
+  beq := Level'.eq
+
+end Level'
+
+section
+variable {m : Type → Type} [Monad m]
+
+/--
+Applies `f` to (non-recursively) modify handles.
+-/
+def Level.mapM {ℓ ℓ'} (f : ℓ → m ℓ') (u : Level ℓ) : m (Level ℓ') := do
+  match u with
+  | .zero => return .zero
+  | .offset v n => return .offset (← f v) n
+  | .max v w => return .max (← f v) (← f w)
+  | .ipos v w => return .ipos (← f v) (← f w)
+  | .param n => return .param n
+  | .mvar mvarId => return .mvar mvarId
+
+section
+variable [MonadGetLevel m ℓ]
+
+/-- See `Level'.hasParam` -/
+def levelHasParam (u : ℓ) : m Bool := do
+  return (← getLevelGetter).mkHandle u |>.hasParam
+
+/-- See `Level'.hasMVar` -/
+def levelHasMVar (u : ℓ) : m Bool := do
+  return (← getLevelGetter).mkHandle u |>.hasMVar
+
+/-- See `Level'.isZero` -/
+def isLevelZero (u : ℓ) : m Bool :=
+  return (← getLevelGetter).mkHandle u |>.isZero
+
+/-- See `Level'.getOffset` -/
+partial def getLevelOffset (u : ℓ) : m (ℓ × Nat) := do
+  let (u', c) := (← getLevelGetter).mkHandle u |>.getOffset
+  return (u'.handle, c)
+
+/-- See `Level'.isAlwaysZero` -/
+partial def isLevelAlwaysZero (u : ℓ) : m Bool :=
+  return (← getLevelGetter).mkHandle u |>.isAlwaysZero
+
+/-- See `Level'.isNeverZero` -/
+partial def isLevelNeverZero (u : ℓ) : m Bool := do
+  return (← getLevelGetter).mkHandle u |>.isNeverZero
+
+/--
+Returns `true` if `u` and `v` are structurally equal.
+See `Level'.levelEq`.
 -/
 partial def levelEq [BEq ℓ] (u v : ℓ) : m Bool := do
-  if u == v then
-    return true
-  if (← levelHash u) != (← levelHash v) then
-    return false
-  match (← getLevel u), (← getLevel v) with
-  | .zero, .zero => return true
-  | .offset ua un, .offset va vn => pure (un == vn) <&&> levelEq ua va
-  | .max ua ub, .max va vb => levelEq ua va <&&> levelEq ub vb
-  | .ipos ua ub, .ipos va vb => levelEq ua va <&&> levelEq ub vb
-  | .param un, .param vn => return un == vn
-  | .mvar uMVarId, .mvar vMVarId => return uMVarId == vMVarId
-  | _, _ => return false
+  let ctx ← getLevelGetter
+  return ctx.mkHandle u == ctx.mkHandle v
 
 end
 
 section
 variable [MonadMkLevel m ℓ]
+
+/-- Makes `Level.zero`. -/
+def mkLevelZero : m ℓ := mkLevel .zero
+
+/-- `mkLevelOffset u n` makes `Level.offset u n`. Returns `u` if `n = 0`. -/
+def mkLevelOffset (u : ℓ) (n : Nat) : m ℓ := mkLevel (.offset u n)
+
+/-- Makes `Level.max u v`. -/
+def mkLevelMax (u v : ℓ) : m ℓ := mkLevel (.max u v)
+
+/-- Makes `Level.ipos u v`. This represents `if v > 0 then u else 0`. -/
+def mkLevelIPos (u v : ℓ) : m ℓ := mkLevel (.ipos u v)
+
+/-- Makes `Level.param n`. -/
+def mkLevelParam (n : Name) : m ℓ := mkLevel (.param n)
+
+/-- Makes `Level.mvar mvarId`. -/
+def mkLevelMVar (mvarId : LMVarId) : m ℓ := mkLevel (.mvar mvarId)
 
 /-- Makes `Level.zero + n`. -/
 def mkLevelConst (n : Nat) : m ℓ := do
@@ -179,8 +259,14 @@ def mkLevelIMax (u v : ℓ) : m ℓ := do
 def mkLevelSucc (u : ℓ) : m ℓ := do
   mkLevelOffset u 1
 
+def mkLevelMaxN (us : Array ℓ) : m ℓ := do
+  if h : us.size = 0 then
+    mkLevelZero
+  else
+    us.foldrM (start := us.size - 1) (init := us.back) mkLevelMax
+
 section Update
-variable [MonadGetLevel m ℓ] [BEq ℓ]
+variable [Inhabited ℓ] [MonadGetLevel m ℓ] [BEq ℓ]
 
 /-- Does `mkLevelOffset newU newC`, but returns `orig` if possible. -/
 def updateLevelOffset (orig newU : ℓ) (newC : Nat) : m ℓ := do
@@ -189,7 +275,7 @@ def updateLevelOffset (orig newU : ℓ) (newC : Nat) : m ℓ := do
       return orig
   mkLevelOffset newU newC
 
-/-- Does `mkLevelMax' newU newV`, but returns `orig` if possible. -/
+/-- Does `mkLevelMax newU newV`, but returns `orig` if possible. -/
 def updateLevelMax (orig newU newV : ℓ) : m ℓ := do
   if let .max u v ← getLevel orig then
     if u == newU && v == newV then
@@ -205,6 +291,7 @@ def updateLevelIPos (orig newU newV : ℓ) : m ℓ := do
 
 /--
 Applies `f` to update handles (non-recursively).
+Like `Level.mapM` but attempts to reuse the original level.
 -/
 def levelMapM (f : ℓ → m ℓ) (u : ℓ) : m ℓ := do
   match (← getLevel u) with
@@ -232,7 +319,7 @@ partial def levelReplaceParams (f : Name → m (Option ℓ)) (u : ℓ) : m ℓ :
     return u
 
 /--
-Replaces levels in `u` using `f`.
+Replaces level metavariables in `u` using `f`.
 -/
 partial def levelReplaceMVars (f : LMVarId → m (Option ℓ)) (u : ℓ) : m ℓ := do
   if (← levelHasMVar u) then
@@ -279,6 +366,12 @@ partial def mkLevelIPos' [BEq ℓ] (u v : ℓ) : m ℓ := do
   if (← isLevelNeverZero v) then
     return u
   mkLevelIPos u v
+
+def mkLevelMaxN' (us : Array ℓ) : m ℓ := do
+  if h : us.size = 0 then
+    mkLevelZero
+  else
+    us.foldrM (start := us.size - 1) (init := us.back) mkLevelMax'
 
 end
 
@@ -390,8 +483,6 @@ This is the normal form, assuming `u` comes before `v` comes before `w` in the
 total order on universe level parameters.
 -/
 
-variable [MonadGetLevel m ℓ]
-
 /--
 Folds over all components of a `max` level expression while distributing
 offsets. Calls `f` with each `u'+offset` pair. The level `u'` is zero, a
@@ -400,17 +491,17 @@ never an `offset` expression.
 
 For example, `max ((max u v) + 2) w` will call `f` on `u+2`, `v+2`, and `f w`.
 -/
-partial def foldLevelMaxM {α : Type} (u : ℓ)
-    (f : α → ℓ → Nat → m α) (init : α) (offset : Nat := 0) :
-    m α :=
-  go u offset init
+partial def LevelGetter.foldLevelMaxM (ctx : LevelGetter ℓ) {α : Type}
+    (u : ℓ) (f : α → ℓ → Nat → α) (init : α) (offset : Nat := 0) :
+    α :=
+  go (ctx.mkHandle u) offset init
 where
-  go (u : ℓ) (offset : Nat) (init : α) : m α := do
-    let (u', uOffset) ← getLevelOffset u
+  go (u : Level' ctx) (offset : Nat) (init : α) : α :=
+    let (u', uOffset) := u.getOffset
     let offset' := offset + uOffset
-    match ← getLevel u' with
-    | .max v w => go w offset' (← go v offset' init)
-    | _ => f init u' offset'
+    match u'.get with
+    | .max v w => go w offset' (go v offset' init)
+    | _ => f init u'.handle offset'
 
 /--
 Used for normalization (see `LevelMaxTerm`).
@@ -496,27 +587,28 @@ def LevelMaxView.eq (view1 view2 : LevelMaxView ℓ) : Bool :=
   view1.terms == view2.terms
 
 /-- Computes the view of `max (u + offset) view`. -/
-partial def accLevelMaxView (u : ℓ) (offset : Nat) (view : LevelMaxView ℓ) :
-    m (LevelMaxView ℓ) :=
+partial def LevelGetter.accLevelMaxView (ctx : LevelGetter ℓ)
+    (u : ℓ) (offset : Nat) (view : LevelMaxView ℓ) :
+    LevelMaxView ℓ :=
   visit u offset #[] view
 where
   visit (u : ℓ) (offset : Nat) (cond : Array (LevelBase ℓ))
-      (view : LevelMaxView ℓ) : m (LevelMaxView ℓ) :=
-    foldLevelMaxM (init := view) (offset := offset) u fun view u' offset => do
-      match (← getLevel u') with
+      (view : LevelMaxView ℓ) : LevelMaxView ℓ :=
+    ctx.foldLevelMaxM (init := view) (offset := offset) u fun view u' offset =>
+      match ctx.get u' with
       | .zero =>
         if offset == 0 then
-          return view
+          view
         else
-          return view.insert { base := .zero, offset, cond }
+          view.insert { base := .zero, offset, cond }
       | .param n =>
         let base := LevelBase.param u' n
         let cond := if offset > 0 then cond else cond.filter (!base.eq ·)
-        return view.insert { base, offset, cond }
+        view.insert { base, offset, cond }
       | .mvar mvarId =>
         let base := LevelBase.mvar u' mvarId
         let cond := if offset > 0 then cond else cond.filter (!base.eq ·)
-        return view.insert { base, offset, cond }
+        view.insert { base, offset, cond }
       | .ipos v w =>
         let view := -- `(ipos v w) + offset = max (ipos (v + offset) w) offset`
           if offset == 0 then view
@@ -524,15 +616,15 @@ where
         foldIPos w (visit v offset) cond view
       | _ => unreachable!
   foldIPos (w : ℓ)
-      (f : Array (LevelBase ℓ) → LevelMaxView ℓ  → m (LevelMaxView ℓ))
+      (f : Array (LevelBase ℓ) → LevelMaxView ℓ  → LevelMaxView ℓ)
       (cond : Array (LevelBase ℓ)) (view : LevelMaxView ℓ) :
-      m (LevelMaxView ℓ) :=
-    foldLevelMaxM w (init := view) fun view u' offset => do
+      LevelMaxView ℓ :=
+    ctx.foldLevelMaxM w (init := view) fun view u' offset =>
       if offset > 0 then
-        return view
+        view
       else
-        match (← getLevel u') with
-        | .zero => return view
+        match ctx.get u' with
+        | .zero => view
         | .param n =>
           let base := LevelBase.param u' n
           let cond := cond.binInsert LevelBase.lt base
@@ -545,8 +637,9 @@ where
           foldIPos u (foldIPos v f) cond view
         | _ => unreachable!
 
-def mkLevelMaxView (u : ℓ) (offset : Nat := 0) : m (LevelMaxView ℓ) :=
-  accLevelMaxView u offset {}
+def LevelGetter.mkLevelMaxView (ctx : LevelGetter ℓ)
+    (u : ℓ) (offset : Nat := 0) : LevelMaxView ℓ :=
+  ctx.accLevelMaxView u offset {}
 
 /--
 Eliminates terms that are implied by others.
@@ -579,41 +672,41 @@ Returns true if the level is already obviously in normal form.
 This is used to save work while normalizating level expressions.
 This currently handles everything that doesn't have `ipos` expressions.
 -/
-partial def levelIsAlreadyNormalizedQuick (u : ℓ) : m Bool := do
-  if (← getAtom? u).isSome then
-    return true
-  else
-    match (← getLevel u) with
+partial def LevelGetter.levelIsAlreadyNormalizedQuick
+    (ctx : LevelGetter ℓ) (u : ℓ) : Bool :=
+  (getAtom? u).isSome ||
+    match ctx.get u with
     | .max v w =>
-      let some (b, c) ← getAtom? v | return false
-      visitMax b c w
-    | _ => return false
-where
-  getAtom? (u : ℓ) : m (Option (LevelBase ℓ × Nat)) := do
-    let (u, u', c) ←
-      match (← getLevel u) with
-      | .offset v c =>
-        if c == 0 then return none
-        else pure (v, ← getLevel v, c)
-      | u' => pure (u, u', 0)
-    match u' with
-    | .zero => return some (.zero, c)
-    | .param n => return some (.param u n, c)
-    | .mvar mvarId => return some (.mvar u mvarId, c)
-    | _ => return none
-  visitMax (curr : LevelBase ℓ) (maxOffset : Nat) (u : ℓ) : m Bool := do
-    match (← getLevel u) with
-    | .max v w =>
-      let some (b, c) ← getAtom? v | return false
-      unless curr.lt b do return false
-      visitMax b (max maxOffset c) w
-    | _ =>
-      let some (b, c) ← getAtom? u | return false
-      unless curr.lt b do return false
-      if b.isZero then
-        return maxOffset < c
+      if let some (b, c) := getAtom? v then
+        visitMax b c w
       else
-        return true
+        false
+    | _ => false
+where
+  getAtom? (u : ℓ) : Option (LevelBase ℓ × Nat) := do
+    let (u, u', c) ←
+      match ctx.get u with
+      | .offset v c =>
+        if c == 0 then none
+        else some (v, ctx.get v, c)
+      | u' => some (u, u', 0)
+    match u' with
+    | .zero => some (.zero, c)
+    | .param n => some (.param u n, c)
+    | .mvar mvarId => some (.mvar u mvarId, c)
+    | _ => none
+  visitMax (curr : LevelBase ℓ) (maxOffset : Nat) (u : ℓ) : Bool :=
+    match ctx.get u with
+    | .max v w =>
+      if let some (b, c) := getAtom? v then
+        curr.lt b && visitMax b (max maxOffset c) w
+      else
+        false
+    | _ =>
+      if let some (b, c) := getAtom? u then
+        curr.lt b && (!b.isZero || maxOffset < c)
+      else
+        false
 
 variable [MonadMkLevel m ℓ]
 
@@ -649,16 +742,27 @@ Does not instantiate level metavariables.
 Uses an evaluation/simplification/reflection approach, using `LevelMaxView`
 as an intermediate representation.
 -/
-def normalizeLevel (u : ℓ) : m ℓ := do
-  if ← levelIsAlreadyNormalizedQuick u then
+def normalizeLevel [MonadGetLevel m ℓ] (u : ℓ) : m ℓ := do
+  let ctx ← getLevelGetter
+  if ctx.levelIsAlreadyNormalizedQuick u then
     return u
   else
-    (← mkLevelMaxView u).simplify.mkLevel
+    (ctx.mkLevelMaxView u).simplify.mkLevel
 
 end Normalize
 
-section
-variable [MonadMkLevel m ℓ] [MonadGetLevel m ℓ]
+def Level'.mkLevelMaxView {ctx : LevelGetter ℓ} (u : Level' ctx) :
+    LevelMaxView ℓ :=
+  ctx.mkLevelMaxView u.handle
+
+def Level'.equiv {ctx : LevelGetter ℓ} [BEq ℓ] (u v : Level' ctx) : Bool :=
+  u == v || u.mkLevelMaxView.eq v.mkLevelMaxView
+
+def Level'.le {ctx : LevelGetter ℓ} [BEq ℓ] (u v : Level' ctx) : Bool :=
+  u == v ||
+    let uView := u.mkLevelMaxView
+    let vView := v.mkLevelMaxView
+    uView.terms.all (fun t => vView.terms.any (·.subsumes t))
 
 /--
 Returns true if the levels are equivalent.
@@ -669,13 +773,9 @@ levelEq (← normalizeLevel u) (← normalizeLevel v)
 ```
 However, we can skip the reification step and compare `LevelMaxView`s directly.
 -/
-partial def levelEquiv [BEq ℓ] (u v : ℓ) : m Bool := do
-  if ← levelEq u v then
-    return true
-  else
-    let uView := (← mkLevelMaxView u).simplify
-    let vView := (← mkLevelMaxView v).simplify
-    return uView.eq vView
+def levelEquiv [MonadGetLevel m ℓ] [BEq ℓ] (u v : ℓ) : m Bool := do
+  let ctx ← getLevelGetter
+  return Level'.equiv (ctx.mkHandle u) (ctx.mkHandle v)
 
 /--
 Returns true if for all concrete assignments of variables in `u` and `v`
@@ -683,12 +783,9 @@ the first is less than or equal to the second.
 
 If `levelLE u v` and `levelLE v u` then `levelEquiv u v`.
 -/
-partial def levelLE (u v : ℓ) : m Bool := do
-  let uView ← mkLevelMaxView u
-  let vView ← mkLevelMaxView v
-  return uView.terms.all (fun t => vView.terms.any (·.subsumes t))
-
-end
+partial def levelLE [MonadGetLevel m ℓ] [BEq ℓ] (u v : ℓ) : m Bool := do
+  let ctx ← getLevelGetter
+  return Level'.le (ctx.mkHandle u) (ctx.mkHandle v)
 
 end
 
