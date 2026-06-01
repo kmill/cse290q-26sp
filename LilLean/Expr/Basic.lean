@@ -18,6 +18,27 @@ namespace LilLean
 
 variable {ℓ ε : Type}
 
+protected def Expr.eq [BEq ℓ] [BEq ε] (e e' : Expr ℓ ε) (alpha : Bool) : Bool :=
+  match e, e' with
+  | .bvar idx, .bvar idx' => idx == idx'
+  | .fvar fvarId, .fvar fvarId' => fvarId == fvarId'
+  | .mvar mvarId, .mvar mvarId' => mvarId == mvarId'
+  | .sort u, .sort u' => u == u'
+  | .const c us, .const c' us' =>
+    c == c' && us.length == us'.length
+    && (us.zip us').all fun (u, u') => u == u'
+  | .app f a, .app f' a' => f == f' && a == a'
+  | .lam n t b i, .lam n' t' b' i' =>
+    (alpha || (n == n' && i == i')) && t == t' && b == b'
+  | .pi n t b i, .pi n' t' b' i' =>
+    (alpha || (n == n' && i == i')) && t == t' && b == b'
+  | .let n t v b, .let n' t' v' b' =>
+    (alpha || n == n') && t == t' && v == v' && b == b'
+  | .lit l, .lit l' => l == l'
+  | .proj t i s, .proj t' i' s' =>
+    i == i' && t == t' && s == s'
+  | _, _ => false
+
 /-
 Recall the structure of the hash, described in `MonadGetExpr.exprHash`:
 - Bit 0 is 1 iff the expr has a level `param`.
@@ -146,6 +167,161 @@ def Expr.hashCore (e : Expr ℓ ε)
       approxDepth := hStruct.approxDepth + 1
       hash := mixHash 10 <| mixHash (hash typeName) <| mixHash (hash idx) hStruct.hash }
 
+instance [Hashable ℓ] [Hashable ε] : Hashable (Expr ℓ ε) where
+  hash e := Expr.hashCore e hash hash
+
+/--
+Applies `f` and `g` to (non-recursively) update handles.
+The `g` function gets additional information about the De Bruijn depth.
+-/
+def Expr.mapDepth {ℓ ℓ' ε ε'} (f : ℓ → ℓ') (g : ε → Nat → ε')
+    (e : Expr ℓ ε) (depth : Nat) : Expr ℓ' ε' :=
+  match e with
+  | .bvar idx => .bvar idx
+  | .fvar fvarId => .fvar fvarId
+  | .mvar mvarId => .mvar mvarId
+  | .sort u => .sort (f u)
+  | .const declName us => .const declName (us.map f)
+  | .app fn arg => .app (g fn depth) (g arg depth)
+  | .lam n t b i => .lam n (g t depth) (g b (depth + 1)) i
+  | .pi n t b i => .pi n (g t depth) (g b (depth + 1)) i
+  | .let n t v b => .let n (g t depth) (g v depth) (g b (depth + 1))
+  | .lit l => .lit l
+  | .proj t i s => .proj t i (g s depth)
+
+def Expr.map {ℓ ℓ' ε ε'} (f : ℓ → ℓ') (g : ε → ε')
+    (e : Expr ℓ ε) : Expr ℓ' ε' :=
+  Expr.mapDepth f (fun e' _ => g e') e 0
+
+instance : Functor (Expr ℓ) where
+  map := Expr.map id
+
+def ExprGetter.mkExpr' (ctx : ExprGetter ℓ ε) (e : ε) (alpha : Bool := false) :
+    Expr' ctx alpha :=
+  { handle := e }
+
+namespace Expr'
+variable {alpha : Bool} {ctx : ExprGetter ℓ ε}
+variable (e e' : Expr' ctx alpha)
+
+def get : Expr (Level' ctx.level) (Expr' ctx alpha) :=
+  Expr.map ctx.mkLevel' (ctx.mkExpr' · alpha) (ctx.getExpr e.handle)
+
+def hash : UInt64 := ctx.exprHash e.handle
+
+/--
+Returns true if the expression contains a level parameter.
+-/
+def hasLevelParam : Bool := e.hash &&& 1 > 0
+
+/--
+Returns true if the expression contains a level metavariable.
+(Note: true even if the metavariable is assigned.)
+-/
+def hasLevelMVar : Bool := e.hash &&& 2 > 0
+
+/--
+Returns true if the expression contains an fvar.
+-/
+def hasFVar : Bool := e.hash &&& 4 > 0
+
+/--
+Returns true if the expression contains an expression mvar.
+(Note: true even if the metavariable is assigned.)
+-/
+def hasExprMVar : Bool := e.hash &&& 8 > 0
+
+/--
+Returns true if the expression contains a level or expression mvar.
+(Note: true even if the metavariable is assigned.)
+-/
+def hasMVar : Bool := e.hasLevelMVar || e.hasExprMVar
+
+/--
+Returns the depth of recursion of the expression, saturated at 255.
+-/
+def approxDepth : Nat :=
+  (ExprHashData.decode e.hash).approxDepth.toNat
+
+/--
+Returns the (exclusive) upper bound for loose bvars appearing in the expression.
+For example, the loose bvar range for `.bvar 2` is `3`, and the loose bvar
+range for `.const ..` is `0`.
+-/
+def looseBVarRange : Nat :=
+  (ExprHashData.decode e.hash).looseBVarRange
+
+/--
+Returns true if the expression contains a loose bvar (i.e. if it is not
+locally closed).
+-/
+def hasLooseBVars : Bool :=
+  e.looseBVarRange > 0
+
+/--
+Returns `true` if `u` and `v` are structurally equal.
+If `alpha` is true, then ignores binder names and binder info.
+This implements the `BEq` instance for `Expr'`.
+-/
+protected partial def eq [BEq ℓ] [BEq ε] (e e' : Expr' ctx alpha) : Bool :=
+  let : BEq (Expr (Level' ctx.level) (Expr' ctx alpha)) :=
+    let : BEq (Expr' ctx alpha) := ⟨Expr'.eq⟩
+    ⟨Expr.eq (alpha := alpha)⟩
+  if e.handle == e'.handle then
+    true
+  else if e.hash != e'.hash then
+    -- Note: we are relying on the fact that the hash function ignores
+    -- binder names and binder info.
+    false
+  else
+    e.get == e'.get
+
+instance [BEq ℓ] [BEq ε] : BEq (Expr' ctx alpha) where
+  beq := Expr'.eq
+
+end Expr'
+
+section Accessors
+variable {ctx : ExprGetter ℓ ε} {alpha : Bool}
+
+partial def Expr'.getAppNumArgs (e : Expr' ctx alpha) : Nat :=
+  go e 0
+where
+  go (e : Expr' ctx alpha) (acc : Nat) : Nat :=
+    match e.get with
+    | .app f _ => go f (acc + 1)
+    | _ => acc
+
+private partial def Expr'.withRevAppAux {α} [Inhabited α]
+    (e : Expr' ctx alpha) (revArgs : Array (Expr' ctx alpha))
+    (k : Expr' ctx alpha → Array (Expr' ctx alpha) → α) : α :=
+  match e.get with
+  | .app f a => withRevAppAux f (revArgs.push a) k
+  | _ => k e revArgs
+
+partial def Expr'.withRevApp {α} [Inhabited α] (e : Expr' ctx alpha)
+    (k : Expr' ctx alpha → Array (Expr' ctx alpha) → α) : α :=
+  withRevAppAux e #[] k
+
+partial def Expr'.withApp {α} [Inhabited α] (e : Expr' ctx alpha)
+    (k : Expr' ctx alpha → Array (Expr' ctx alpha) → α) : α :=
+  withRevAppAux e #[] fun f revArgs => k f revArgs.reverse
+
+partial def Expr'.getAppFn (e : Expr' ctx alpha) : Expr' ctx alpha :=
+  match e.get with
+  | .app f _ => f.getAppFn
+  | _ => e
+
+partial def Expr'.getAppRevArgs (e : Expr' ctx alpha) :
+    Array (Expr' ctx alpha) :=
+  e.withRevApp fun _ revArgs => revArgs
+
+partial def Expr'.getAppArgs (e : Expr' ctx alpha) :
+    Array (Expr' ctx alpha) :=
+  e.withApp fun _ args => args
+
+end Accessors
+
 section
 variable {m : Type → Type} [Monad m]
 
@@ -153,94 +329,146 @@ variable {m : Type → Type} [Monad m]
 Applies `f` and `g` to (non-recursively) update handles.
 The `g` function gets additional information about the De Bruijn depth.
 -/
-def Expr.mapM (f : ℓ → m ℓ) (g : ε → Nat → m ε) (e : Expr ℓ ε) (depth : Nat) :
-    m (Expr ℓ ε) := do
+def Expr.mapDepthM {ℓ ℓ' ε ε'} (f : ℓ → m ℓ') (g : ε → Nat → m ε')
+    (e : Expr ℓ ε) (depth : Nat) : m (Expr ℓ' ε') := do
   match e with
-  | .bvar _ => return e
-  | .fvar _ => return e
-  | .mvar _ => return e
+  | .bvar idx => return .bvar idx
+  | .fvar fvarId => return .fvar fvarId
+  | .mvar mvarId => return .mvar mvarId
   | .sort u => return .sort (← f u)
   | .const declName us => return .const declName (← us.mapM f)
   | .app fn arg => return .app (← g fn depth) (← g arg depth)
   | .lam n t b i => return .lam n (← g t depth) (← g b (depth + 1)) i
   | .pi n t b i => return .pi n (← g t depth) (← g b (depth + 1)) i
   | .let n t v b => return .let n (← g t depth) (← g v depth) (← g b (depth + 1))
-  | .lit _ => return e
+  | .lit l => return .lit l
   | .proj t i s => return .proj t i (← g s depth)
+
+def Expr.mapM (f : ℓ → m ℓ) (g : ε → m ε)
+    (e : Expr ℓ ε) : m (Expr ℓ ε) :=
+  Expr.mapDepthM f (fun e' _ => g e') e 0
 
 section
 variable [MonadGetExpr m ℓ ε]
 
 def exprHasLevelParam (e : ε) : m Bool := do
-  return (← exprHash e) &&& 1 > 0
+  return (← getExprGetter).mkExpr' e |>.hasLevelParam
 
 def exprHasLevelMVar (e : ε) : m Bool := do
-  return (← exprHash e) &&& 2 > 0
+  return (← getExprGetter).mkExpr' e |>.hasLevelMVar
 
 def exprHasFVar (e : ε) : m Bool := do
-  return (← exprHash e) &&& 4 > 0
+  return (← getExprGetter).mkExpr' e |>.hasFVar
 
 def exprHasExprMVar (e : ε) : m Bool := do
-  return (← exprHash e) &&& 8 > 0
+  return (← getExprGetter).mkExpr' e |>.hasExprMVar
 
-/--
-Returns true if the expression has either a level or expression
-metavariable.
--/
 def exprHasMVar (e : ε) : m Bool := do
-  return (← exprHash e) &&& (8 ||| 2) > 0
+  return (← getExprGetter).mkExpr' e |>.hasMVar
 
 def exprApproxDepth (e : ε) : m Nat := do
-  return (ExprHashData.decode (← exprHash e)).approxDepth.toNat
+  return (← getExprGetter).mkExpr' e |>.approxDepth
 
 def exprLooseBVarRange (e : ε) : m Nat := do
-  return (ExprHashData.decode (← exprHash e)).looseBVarRange
+  return (← getExprGetter).mkExpr' e |>.looseBVarRange
 
 def exprHasLooseBVars (e : ε) : m Bool := do
-  return (← exprLooseBVarRange e) > 0
+  return (← getExprGetter).mkExpr' e |>.hasLooseBVars
 
 /--
 Returns `true` if `u` and `v` are structurally equal.
 
-If `lax` is true, then ignores binder names and binder info.
-(Note: This feature relies on the fact that the hash function ignores these.)
+If `alpha` is true, then ignores binder names and binder info.
 -/
-partial def exprEq [BEq ℓ] [BEq ε] (e e' : ε) (lax : Bool := false) :
+partial def exprEq [BEq ℓ] [BEq ε] (e e' : ε) (alpha : Bool := false) :
     m Bool := do
-  if e == e' then
-    return true
-  if (← exprHash e) != (← exprHash e') then
-    return false
-  match (← getExpr e), (← getExpr e') with
-  | .bvar idx, .bvar idx' => return idx == idx'
-  | .fvar fvarId, .fvar fvarId' => return fvarId == fvarId'
-  | .mvar mvarId, .mvar mvarId' => return mvarId == mvarId'
-  | .sort u, .sort u' => levelEq u u'
-  | .const c us, .const c' us' =>
-    pure (c == c' && us.length == us'.length)
-    <&&> (us.zip us').allM fun (u, u') => levelEq u u'
-  | .app f a, .app f' a' =>
-    exprEq f f' lax <&&> exprEq a a' lax
-  | .lam n t b i, .lam n' t' b' i' =>
-    pure (lax || (n == n' && i == i'))
-    <&&> exprEq t t' lax <&&> exprEq b b' lax
-  | .pi n t b i, .pi n' t' b' i' =>
-    pure (lax || (n == n' && i == i'))
-    <&&> exprEq t t' lax <&&> exprEq b b' lax
-  | .let n t v b, .let n' t' v' b' =>
-    pure (lax || n == n')
-    <&&> exprEq t t' lax <&&> exprEq v v' lax <&&> exprEq b b' lax
-  | .lit l, .lit l' => return l == l'
-  | .proj t i s, .proj t' i' s' =>
-    pure (i == i' && t == t') <&&> exprEq s s' lax
-  | _, _ => return false
+  let ctx ← getExprGetter
+  return ctx.mkExpr' e alpha == ctx.mkExpr' e' alpha
 
 /--
 Returns `true` if `u` and `v` are structurally equal while ignoring binder
-names and binder info.
+names and binder info. This is a wrapper around `exprEq (alpha := true)`.
 -/
 partial def exprEquiv [BEq ℓ] [BEq ε] (e e' : ε) : m Bool :=
-  exprEq e e' (lax := true)
+  exprEq e e' (alpha := true)
+
+partial def exprGetAppNumArgs (e : ε) : m Nat :=
+  return (← getExprGetter).mkExpr' e |>.getAppNumArgs
+
+partial def exprWithRevApp {α} [Inhabited α] (e : ε)
+    (k : ε → Array ε → m α) : m α := do
+  (← getExprGetter).mkExpr' e |>.withRevApp fun f revArgs =>
+    k f.handle (revArgs.map (·.handle))
+
+partial def exprWithApp {α} [Inhabited α] (e : ε)
+    (k : ε → Array ε → m α) : m α := do
+  (← getExprGetter).mkExpr' e |>.withApp fun f args =>
+    k f.handle (args.map (·.handle))
+
+partial def exprGetAppFn (e : ε) : m ε :=
+  return (← getExprGetter).mkExpr' e |>.getAppFn.handle
+
+partial def exprGetAppRevArgs (e : ε) : m (Array ε) :=
+  return (← getExprGetter).mkExpr' e |>.getAppRevArgs |>.map (·.handle)
+
+partial def exprGetAppArgs (e : ε) : m (Array ε) :=
+  return (← getExprGetter).mkExpr' e |>.getAppArgs |>.map (·.handle)
+
+section
+variable [MonadMkExpr m ℓ ε]
+
+def mkExprBVar (idx : Nat) : m ε := mkExpr (.bvar idx)
+
+def mkExprFVar (fvarId : FVarId) : m ε := mkExpr (.fvar fvarId)
+
+def mkExprMVar (mvarId : MVarId) : m ε := mkExpr (.mvar mvarId)
+
+def mkExprSort (u : ℓ) : m ε := mkExpr (.sort u)
+
+def mkExprConst (declName : Name) (us : List ℓ) : m ε :=
+  mkExpr (.const declName us)
+
+def mkExprApp (fn : ε) (arg : ε) : m ε := mkExpr (.app fn arg)
+
+def mkExprAppN (f : ε) (args : Array ε) : m ε :=
+  args.foldlM (init := f) mkExprApp
+
+def mkExprLam (binderName : Name) (binderType : ε) (body : ε)
+    (binderInfo : BinderInfo) : m ε :=
+  mkExpr (.lam binderName binderType body binderInfo)
+
+def mkExprPi (binderName : Name) (binderType : ε) (body : ε)
+    (binderInfo : BinderInfo) : m ε :=
+  mkExpr (.pi binderName binderType body binderInfo)
+
+def mkExprLet (declName : Name) (type : ε) (value : ε) (body : ε) : m ε :=
+  mkExpr (.let declName type value body)
+
+def mkExprLit (l : Literal) : m ε := mkExpr (.lit l)
+
+def mkExprProj (typeName : Name) (idx : Nat) (struct : ε) : m ε :=
+  mkExpr (.proj typeName idx struct)
+
+/--
+Represents the choice of either an `Expr.lam` or `Expr.pi` constructor.
+The motivation is that many constructions work for both lambda expressions
+and pi types.
+-/
+inductive BindingKind
+  | lam
+  | pi
+
+/--
+Constructs either an `Expr.lam` or `Expr.pi` depending on the `kind`.
+-/
+def BindingKind.mk (kind : BindingKind)
+    (binderName : Name) (binderType : ε) (body : ε) (binderInfo : BinderInfo) :
+    m ε :=
+  match kind with
+  | .lam => mkExprLam binderName binderType body binderInfo
+  | .pi => mkExprPi binderName binderType body binderInfo
+
+end
 
 section Update
 variable [MonadMkExpr m ℓ ε] [BEq ℓ] [BEq ε]
@@ -295,10 +523,11 @@ def updateExprProj (orig : ε) (newTypeName : Name) (newIdx : Nat)
   mkExprProj newTypeName newIdx newStruct
 
 /--
-Applies `f` and `g` to (non-recursively) update handles,
+Applies `f` and `g` to (non-recursively) update level and expression handles,
 returning the original expression if possible.
 -/
-def exprMapM (f : ℓ → m ℓ) (g : ε → Nat → m ε) (e : ε) (depth : Nat) : m ε := do
+def exprMapDepthM (f : ℓ → m ℓ) (g : ε → Nat → m ε)
+    (e : ε) (depth : Nat) : m ε := do
   match (← getExpr e) with
   | .bvar _ => return e
   | .fvar _ => return e
@@ -313,10 +542,10 @@ def exprMapM (f : ℓ → m ℓ) (g : ε → Nat → m ε) (e : ε) (depth : Nat
   | .proj t i s => updateExprProj e t i (← g s depth)
 
 /--
-Applies `g` to (non-recursively) update handles,
+Applies `g` to (non-recursively) update expression handles,
 returning the original expression if possible.
 -/
-def exprMapM' (g : ε → Nat → m ε) (e : ε) (depth : Nat) : m ε := do
+def exprMapDepthM' (g : ε → Nat → m ε) (e : ε) (depth : Nat) : m ε := do
   match (← getExpr e) with
   | .bvar _ => return e
   | .fvar _ => return e
@@ -337,6 +566,9 @@ end
 section ReplaceExpr
 variable [MonadGetExpr m ℓ ε] [MonadMkExpr m ℓ ε]
 
+/--
+Caches for `exprReplace`.
+-/
 private structure ReplaceState
     (ℓ ε : Type) [BEq ℓ] [Hashable ℓ] [BEq ε] [Hashable ε] where
   levels : Std.HashMap ℓ (Option ℓ) := {}
@@ -349,9 +581,10 @@ the children should be visited.
 The function is given the current De Bruijn depth.
 Caches results by handle, so it's able to preserve sharing.
 -/
-partial def exprReplace [BEq ℓ] [Hashable ℓ] [BEq ε] [Hashable ε] (e : ε)
-    (f : ℓ → m (Option ℓ)) (g : ε → Nat → m (Option ε)) : m ε :=
-  goExpr e 0 |>.run' {}
+partial def exprReplaceDepth [BEq ℓ] [Hashable ℓ] [BEq ε] [Hashable ε]
+    (f : ℓ → m (Option ℓ)) (g : ε → Nat → m (Option ε))
+    (e : ε) (depth : Nat) : m ε :=
+  goExpr e depth |>.run' {}
 where
   getf (u : ℓ) : StateT (ReplaceState ℓ ε) m (Option ℓ) := do
     if let some u'? := (← get).levels[u]? then
@@ -378,7 +611,7 @@ where
     if let some e' ← getg e depth then
       return e'
     else
-      exprMapM goLevel goExpr e depth
+      exprMapDepthM goLevel goExpr e depth
 
 /--
 Replaces subexpressions in `e` using `g`. The function returns `none` if
@@ -386,9 +619,10 @@ the children should be visited.
 The function is given the current De Bruijn depth.
 Caches results by handle, so it's able to preserve sharing.
 -/
-partial def exprReplace' [BEq ε] [Hashable ε] (e : ε)
-    (g : ε → Nat → m (Option ε)) : m ε :=
-  go e 0 |>.run' {}
+partial def exprReplaceDepth' [BEq ε] [Hashable ε]
+    (g : ε → Nat → m (Option ε))
+    (e : ε) (depth : Nat := 0) : m ε :=
+  go e depth |>.run' {}
 where
   getg (e : ε) (depth : Nat) :
       StateT (Std.HashMap (ε × Nat) (Option ε)) m (Option ε) := do
@@ -403,46 +637,54 @@ where
     if let some e' ← getg e depth then
       return e'
     else
-      exprMapM' go e depth
+      exprMapDepthM' go e depth
 
 end ReplaceExpr
 
 section InstantiateAbstract
 variable [BEq ε] [Hashable ε] [MonadGetExpr m ℓ ε] [MonadMkExpr m ℓ ε]
 
-/-- Adds `k` to all loose bvars whose index is at least `i`. -/
+/--
+Adds `k` to all loose bvars whose index is at least `i`.
+It is up to the caller to make sure that for each loose de Bruijn index `idx`,
+`idx + k ≥ 0`.
+-/
 def exprLiftLooseBVars (e : ε) (i : Nat) (k : Int) : m ε := do
   if k == 0 then
     return e
   else if (← exprLooseBVarRange e) ≤ i then
     return e
   else
-    exprReplace' e fun e depth => do
+    exprReplaceDepth' (e := e) fun e depth => do
       if (← exprLooseBVarRange e) ≤ i + depth then
         -- No loose bvars to lift
         return some e
       else
         match (← getExpr e) with
-        | .bvar idx => some <$> mkExprBVar (idx + k : Int).toNat
+        | .bvar idx => some <$> mkExprBVar (idx + k).toNat
         | _ => return none -- continue with children expressions
 
 /--
-Uses `xs` to instantiate loose bvars in `e`.
-Variables are indexed from the end of `xs`,
+Uses `xs[beginIdx...endIdx]` to instantiate loose bvars in `e`.
+Variables are indexed from the end of the subarray,
 like `#[, ..., bvar 2, bvar 1, bvar 0]`.
-Loose bvars out of range are decremented by `xs.size`.
+Loose bvars out of range are decremented by `endIdx - beginIdx`.
 
 The expressions in `xs` may have loose bvars, and they will be incremented
 by the De Bruijn depth of the occurrence.
 -/
-def exprInstantiateRev (e : ε) (xs : Array ε) : m ε := do
-  if xs.isEmpty then
+def exprInstantiateRev (e : ε) (xs : Array ε)
+    (beginIdx := 0) (endIdx := xs.size) : m ε := do
+  if beginIdx ≥ endIdx then
+    return e
+  else if h : endIdx > xs.size then
+    panic! "exprInstantiateRev: endIdx out of bounds"
     return e
   else if !(← exprHasLooseBVars e) then
     return e
   else
-    exprReplace' e fun e depth => do
-      if !(← exprHasLooseBVars e) then
+    exprReplaceDepth' (e := e) fun e depth => do
+      if (← exprLooseBVarRange e) ≤ depth then
         -- No loose bvars to substitute
         return some e
       else
@@ -450,10 +692,10 @@ def exprInstantiateRev (e : ε) (xs : Array ε) : m ε := do
         | .bvar idx =>
           if h : idx < depth then
             return some e
-          else if h' : idx < xs.size + depth then
-            some <$> exprLiftLooseBVars xs[idx - depth] 0 depth
+          else if h' : idx - depth + beginIdx < endIdx then
+            some <$> exprLiftLooseBVars xs[idx - depth + beginIdx] 0 depth
           else
-            some <$> mkExprBVar (idx - xs.size)
+            some <$> mkExprBVar (idx - (endIdx - beginIdx))
         | _ => return none -- continue with children subexpressions
 
 /--
@@ -463,8 +705,7 @@ element of the subarray gets `bvar 0`.
 Note: like in Lean 4, pre-existing loose bvars are *not* modified.
 -/
 def exprAbstractFVarRev (e : ε) (xs : Array FVarId)
-    (beginIdx := 0) (endIdx := xs.size) :
-    m ε := do
+    (beginIdx := 0) (endIdx := xs.size) : m ε := do
   if beginIdx ≥ endIdx then
     return e
   else if h : endIdx > xs.size then
@@ -473,7 +714,7 @@ def exprAbstractFVarRev (e : ε) (xs : Array FVarId)
   else if !(← exprHasFVar e) then
     return e
   else
-    exprReplace' e fun e depth => do
+    exprReplaceDepth' (e := e) fun e depth => do
       if !(← exprHasFVar e) then
         -- No fvars to abstract
         return some e
@@ -482,11 +723,75 @@ def exprAbstractFVarRev (e : ε) (xs : Array FVarId)
         | .fvar fvarId =>
           for h : i in [beginIdx:endIdx] do
             have : i < endIdx := by get_elem_tactic
-            have : i < xs.size := by grind
+            have : i < xs.size := by lia
             if xs[i] == fvarId then
               return ← some <$> mkExprBVar (depth + (endIdx - i - 1))
           return some e
         | _ => return none -- continue with children subexpressions
+
+/--
+Constructs the application `e xs...` like `mkExprAppN`, but if `e` is a
+lambda expression does up to `xs.size` head beta reductions.
+-/
+partial def mkExprBetaAppN (e : ε) (xs : Array ε) : m ε := do
+  go e 0
+where
+  finalize (e : ε) (endIdx : Nat) : m ε := do
+    let e' ← exprInstantiateRev e xs (endIdx := endIdx)
+    xs.foldlM (start := endIdx) (init := e') mkExprApp
+  go (e : ε) (endIdx : Nat) : m ε := do
+    if endIdx < xs.size then
+      match (← getExpr e) with
+      | .lam _ _ b _ => go b (endIdx + 1)
+      | _ => finalize e endIdx
+    else
+      finalize e endIdx
+
+/--
+Like `exprInstantiateRev`, but if substitution creates beta redexes they
+are reduced using `mkExprBetaAppN`.
+-/
+partial def exprInstantiateBetaRev [Inhabited ε] (e : ε) (xs : Array ε)
+    (beginIdx := 0) (endIdx := xs.size) : m ε := do
+  if beginIdx ≥ endIdx then
+    return e
+  else if h : endIdx > xs.size then
+    panic! "exprInstantiateBetaRev: endIdx out of bounds"
+    return e
+  else if !(← exprHasLooseBVars e) then
+    return e
+  else
+    go e 0 |>.run' {}
+where
+  go (e : ε) (depth : Nat) (h : ¬ endIdx > xs.size := by assumption) :
+      StateT (Std.HashMap (ε × Nat) ε) m ε := do
+    if depth ≤ (← exprLooseBVarRange e) then
+      return e
+    else if let some e' := (← get)[(e, depth)]? then
+      return e'
+    else
+      let e' ←
+        match (← getExpr e) with
+        | .bvar idx =>
+          if h : idx < depth then
+            return e
+          else if h' : idx - depth + beginIdx < endIdx then
+            exprLiftLooseBVars xs[idx - depth + beginIdx] 0 depth
+          else
+            mkExprBVar (idx - (endIdx - beginIdx))
+        | .app .. =>
+          exprWithApp e fun f args => do
+            let wasBVar := (← getExpr f) matches .bvar ..
+            let f ← go f depth
+            let args ← args.mapM (go · depth)
+            if wasBVar then
+              mkExprBetaAppN f args
+            else
+              mkExprAppN f args
+        | _ => exprMapDepthM' go e depth
+      modify fun s => s.insert (e, depth) e'
+      return e'
+
 
 end InstantiateAbstract
 
@@ -518,34 +823,45 @@ where
         | .proj _ _ s => go s
 
 /--
-Returns true if there is a loose bvar with index `i`.
-This is not a constant time operation.
+Returns true if there is a loose bvar with index `idx` such that
+`beginIdx ≤ i < endIdx`. This is not a constant time operation.
 -/
-partial def exprHasLooseBVarEq (e : ε) (i : Nat) : m Bool := do
-  if (← exprLooseBVarRange e) ≤ i then
+partial def exprHasLooseBVarWithin (e : ε)
+    (beginIdx endIdx : Nat) : m Bool := do
+  if (← exprLooseBVarRange e) ≤ beginIdx || endIdx ≤ beginIdx then
     return false
   else
-    go e i |>.run' {}
+    go e 0 |>.run' {}
 where
-  go (e : ε) (i : Nat) : StateT (Std.HashSet (ε × Nat)) m Bool := do
-    if (← exprLooseBVarRange e) ≤ i then
+  go (e : ε) (depth : Nat) : StateT (Std.HashSet (ε × Nat)) m Bool := do
+    let range ← exprLooseBVarRange e
+    if range ≤ beginIdx + depth then
       return false
-    else if (← get).contains (e, i) then
+    else if range ≤ endIdx + depth then
+      return true
+    else if (← get).contains (e, depth) then
       return false
     else
-      modify fun s => s.insert (e, i)
+      modify fun s => s.insert (e, depth)
       match (← getExpr e) with
-      | .bvar idx => return idx == i
+      | .bvar idx => return beginIdx + depth ≤ idx && idx < endIdx + depth
       | .fvar _ => return false
       | .mvar _ => return false
       | .sort _ => return false
       | .const _ _ => return false
-      | .app fn arg => go fn i <||> go arg i
-      | .lam _ t b _ => go t i <||> go b (i + 1)
-      | .pi _ t b _ => go t i <||> go b (i + 1)
-      | .let _ t v b => go t i <||> go v i <||> go b (i + 1)
+      | .app fn arg => go fn depth <||> go arg depth
+      | .lam _ t b _ => go t depth <||> go b (depth + 1)
+      | .pi _ t b _ => go t depth <||> go b (depth + 1)
+      | .let _ t v b => go t depth <||> go v depth <||> go b (depth + 1)
       | .lit _ => return false
-      | .proj _ _ s => go s i
+      | .proj _ _ s => go s depth
+
+/--
+Returns true if there is a loose bvar with index `i`.
+This is not a constant time operation.
+-/
+partial def exprHasLooseBVarEq (e : ε) (i : Nat) : m Bool := do
+  exprHasLooseBVarWithin e i (i + 1)
 
 /--
 Creates a bitmap `b` of loose bvars up to but not including index `range`.

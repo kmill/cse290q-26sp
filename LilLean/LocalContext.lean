@@ -19,9 +19,11 @@ namespace LilLean
 
 inductive LocalDecl where
   /-- A local constant, representing a lambda binder or a pi binder. -/
-  | protected cdecl (index : Nat) (fvarId : FVarId) (userName : Name) (type : ExprId) (binderInfo : BinderInfo)
+  | protected cdecl (index : Nat) (fvarId : FVarId) (userName : Name)
+      (type : ExprId) (binderInfo : BinderInfo)
   /-- A local `let` definition. -/
-  | protected ldecl (index : Nat) (fvarId : FVarId) (userName : Name) (type value : ExprId)
+  | protected ldecl (index : Nat) (fvarId : FVarId) (userName : Name)
+      (type value : ExprId)
 
 def LocalDecl.index : LocalDecl → Nat
   | .cdecl index _ _ _ _ => index
@@ -29,8 +31,10 @@ def LocalDecl.index : LocalDecl → Nat
 
 def LocalDecl.setIndex (decl : LocalDecl) (index : Nat) : LocalDecl :=
   match decl with
-  | .cdecl _ fvarId userName type binderInfo => .cdecl index fvarId userName type binderInfo
-  | .ldecl _ fvarId userName type value => .ldecl index fvarId userName type value
+  | .cdecl _ fvarId userName type binderInfo =>
+    .cdecl index fvarId userName type binderInfo
+  | .ldecl _ fvarId userName type value =>
+    .ldecl index fvarId userName type value
 
 def LocalDecl.fvarId : LocalDecl → FVarId
   | .cdecl _ fvarId _ _ _ => fvarId
@@ -42,8 +46,10 @@ def LocalDecl.userName : LocalDecl → Name
 
 def LocalDecl.setUserName (decl : LocalDecl) (userName : Name) : LocalDecl :=
   match decl with
-  | .cdecl index fvarId _ type binderInfo => .cdecl index fvarId userName type binderInfo
-  | .ldecl index fvarId _ type value => .ldecl index fvarId userName type value
+  | .cdecl index fvarId _ type binderInfo =>
+    .cdecl index fvarId userName type binderInfo
+  | .ldecl index fvarId _ type value =>
+    .ldecl index fvarId userName type value
 
 def LocalDecl.type : LocalDecl → ExprId
   | .cdecl _ _ _ type _ => type
@@ -51,8 +57,10 @@ def LocalDecl.type : LocalDecl → ExprId
 
 def LocalDecl.setType (decl : LocalDecl) (type : ExprId) : LocalDecl :=
   match decl with
-  | .cdecl index fvarId userName _ binderInfo => .cdecl index fvarId userName type binderInfo
-  | .ldecl index fvarId userName _ value => .ldecl index fvarId userName type value
+  | .cdecl index fvarId userName _ binderInfo =>
+    .cdecl index fvarId userName type binderInfo
+  | .ldecl index fvarId userName _ value =>
+    .ldecl index fvarId userName type value
 
 def LocalDecl.binderInfo : LocalDecl → BinderInfo
   | .cdecl _ _ _ _ binderInfo => binderInfo
@@ -60,7 +68,8 @@ def LocalDecl.binderInfo : LocalDecl → BinderInfo
 
 def LocalDecl.setBinderInfo (decl : LocalDecl) (binderInfo : BinderInfo) : LocalDecl :=
   match decl with
-  | .cdecl index fvarId userName type _ => .cdecl index fvarId userName type binderInfo
+  | .cdecl index fvarId userName type _ =>
+    .cdecl index fvarId userName type binderInfo
   | .ldecl .. => decl
 
 def LocalDecl.value? : LocalDecl → Option ExprId
@@ -70,7 +79,8 @@ def LocalDecl.value? : LocalDecl → Option ExprId
 def LocalDecl.setValue (decl : LocalDecl) (value : ExprId) : LocalDecl :=
   match decl with
   | .cdecl .. => decl
-  | .ldecl index fvarId userName type _ => .ldecl index fvarId userName type value
+  | .ldecl index fvarId userName type _ =>
+    .ldecl index fvarId userName type value
 
 /--
 A list of local declarations (`LocalDecl`s) for free variables (`FVarId`s).
@@ -197,28 +207,32 @@ variable {m : Type → Type} [Monad m] {β : Type}
 def foldlM (lctx : LocalContext)
     (f : β → LocalDecl → m β) (init : β) (start : Nat := 0) :
     m β :=
-  lctx.decls.foldlM (init := init) (start := start) fun b decl => match decl with
+  lctx.decls.foldlM (init := init) (start := start) fun b decl =>
+    match decl with
     | none      => pure b
     | some decl => f b decl
 
 def foldrM (lctx : LocalContext)
     (f : LocalDecl → β → m β) (init : β) :
     m β :=
-  lctx.decls.foldrM (init := init) fun decl b => match decl with
+  lctx.decls.foldrM (init := init) fun decl b =>
+    match decl with
     | none      => pure b
     | some decl => f decl b
 
 def findDeclM? (lctx : LocalContext)
     (f : LocalDecl → m (Option β)) :
     m (Option β) :=
-  lctx.decls.findSomeM? fun decl => match decl with
+  lctx.decls.findSomeM? fun decl =>
+    match decl with
     | none      => pure none
     | some decl => f decl
 
 def findDeclRevM? (lctx : LocalContext)
     (f : LocalDecl → m (Option β)) :
     m (Option β) :=
-  lctx.decls.findSomeRevM? fun decl => match decl with
+  lctx.decls.findSomeRevM? fun decl =>
+    match decl with
     | none      => pure none
     | some decl => f decl
 

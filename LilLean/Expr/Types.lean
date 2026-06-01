@@ -64,6 +64,12 @@ Type of expressions. This type is non-recursive, and recursion is represented
 indirectly through the `ε` type, which represents a handle to an `Expr`.
 The levels are represented indirectly through the `ℓ` type, which represents
 a handle to a `Level`.
+
+Note: One can make a recursive version of this type using
+```
+structure ExprR ℓ where
+  expr : Expr ℓ ExprR
+```
 -/
 inductive Expr (ℓ ε : Type) where
   | bvar (idx : Nat)
@@ -81,13 +87,18 @@ inductive Expr (ℓ ε : Type) where
 instance {ℓ ε} : Inhabited (Expr ℓ ε) := ⟨Expr.const `_default []⟩
 
 /--
-Monad for traversing expressions.
-The handle types `ℓ` and `ε` are determined by the monad `m`.
+Object packaging up the level and expression context states, making it possible
+to create a non-monadic interface for traversing expressions.
+
+The `Expr'` type includes an `ExprGetter` as an inductive type parameter.
 -/
-class MonadGetExpr (m : Type → Type) (ℓ ε : outParam Type)
-    extends MonadGetLevel m ℓ where
-  /-- Gets the expression referred to by the handle `ε`. -/
-  getExpr (e : ε) : m (Expr ℓ ε)
+structure ExprGetter (ℓ ε : Type) extends level : LevelGetter ℓ where
+  /--
+  Gets the expression referred to by the handle `ε`.
+  Returns `default`, and may panic.
+  Should not return `Level.level`.
+  -/
+  getExpr : ε → Expr ℓ ε
   /--
   Returns a hash of the expression, using `Expr.hashCore`. Additionally,
   - Bit 0 is 1 iff the expr has a level `param`.
@@ -98,9 +109,42 @@ class MonadGetExpr (m : Type → Type) (ℓ ε : outParam Type)
   - Bits 12-31 give the range of loose bvars
   - Bits 32-63 are the rest of the hash
   -/
-  exprHash (u : ε) : m UInt64
+  exprHash : ε → UInt64
 
-export MonadGetExpr (getExpr exprHash)
+/--
+Monad for traversing expressions.
+The handle types `ℓ` and `ε` are determined by the monad `m`.
+-/
+class MonadGetExpr (m : Type → Type) (ℓ ε : outParam Type)
+    extends MonadGetLevel m ℓ where
+  getExprGetter : m (ExprGetter ℓ ε)
+
+export MonadGetExpr (getExprGetter)
+
+def getExpr {ℓ ε m} [Monad m] [MonadGetExpr m ℓ ε] (e : ε) : m (Expr ℓ ε) :=
+  return (← getExprGetter).getExpr e
+
+def exprHash {ℓ ε m} [Monad m] [MonadGetExpr m ℓ ε] (e : ε) : m UInt64 :=
+  return (← getExprGetter).exprHash e
+
+/--
+Expression handle that provides a functional interface to traverse its
+structure. The `BEq` instance on this type computes *structural* `Expr`
+equality, rather than mere handle equality. If `alpha` is true, then this
+instance ignores binder names and binder info.
+
+The `ExprGetter` is in the type itself as an inductive type parameter.
+This is a way to conveniently thread this state through computations.
+One can think of it as encoding a specific heap state in the type itself.
+
+Like for `Level'`, be careful to avoid keeping references to a `Expr'`,
+since it creates non-linear uses of the underlying memory. E.g. the old
+`ExprContext` and `LevelContext` will persist, and `mkExpr` and `mkLevel` will
+result in allocating new copies of existing `ExprBlock`s and `LevelBlock`s.
+This is not a matter of correctness, just performance.
+-/
+structure Expr' {ℓ ε : Type} (ctx : ExprGetter ℓ ε) (alpha : Bool) where
+  handle : ε
 
 /--
 Monad for constructing expressions.
@@ -108,53 +152,17 @@ The handle types `ℓ` and `ε` are determined by the monad `m`.
 -/
 class MonadMkExpr (m : Type → Type) (ℓ ε : outParam Type)
     extends MonadMkLevel m ℓ where
-  mkExprBVar (idx : Nat) : m ε
-  mkExprFVar (fvarId : FVarId) : m ε
-  mkExprMVar (mvarId : MVarId) : m ε
-  mkExprSort (u : ℓ) : m ε
-  mkExprConst (declName : Name) (us : List ℓ) : m ε
-  mkExprApp (fn : ε) (arg : ε) : m ε
-  mkExprLam (binderName : Name) (binderType : ε) (body : ε)
-    (binderInfo : BinderInfo) : m ε
-  mkExprPi (binderName : Name) (binderType : ε) (body : ε)
-    (binderInfo : BinderInfo) : m ε
-  mkExprLet (declName : Name) (type : ε) (value : ε) (body : ε) : m ε
-  mkExprLit (l : Literal) : m ε
-  mkExprProj (typeName : Name) (idx : Nat) (struct : ε) : m ε
+  /-- Constructs a handle for the expression. -/
+  mkExpr : Expr ℓ ε → m ε
 
-export MonadMkExpr
-  (mkExprBVar mkExprFVar mkExprSort mkExprMVar mkExprConst mkExprApp mkExprLam
-    mkExprPi mkExprLet mkExprLit mkExprProj)
+export MonadMkExpr (mkExpr)
 
 instance (ℓ ε m n) [MonadLift m n] [MonadGetExpr m ℓ ε] :
     MonadGetExpr n ℓ ε where
-  getExpr e := liftM (getExpr e : m _)
-  exprHash e := liftM (exprHash e : m _)
+  getExprGetter := liftM (getExprGetter : m _)
 
 instance (ℓ ε m n) [MonadLift m n] [MonadMkExpr m ℓ ε] :
     MonadMkExpr n ℓ ε where
-  mkExprBVar idx := liftM (mkExprBVar idx : m _)
-  mkExprFVar fvarId := liftM (mkExprFVar fvarId : m _)
-  mkExprMVar mvarId := liftM (mkExprMVar mvarId : m _)
-  mkExprSort u := liftM (mkExprSort u : m _)
-  mkExprConst declName us := liftM (mkExprConst declName us : m _)
-  mkExprApp fn arg := liftM (mkExprApp fn arg : m _)
-  mkExprLam n t b i := liftM (mkExprLam n t b i : m _)
-  mkExprPi n t b i := liftM (mkExprPi n t b i : m _)
-  mkExprLet n t b v := liftM (mkExprLet n t b v : m _)
-  mkExprLit l := liftM (mkExprLit l : m _)
-  mkExprProj n i s := liftM (mkExprProj n i s : m _)
-
-inductive BindingKind
-  | lam
-  | pi
-
-def BindingKind.mk {ℓ ε m} [MonadMkExpr m ℓ ε]
-    (kind : BindingKind)
-    (binderName : Name) (binderType : ε) (body : ε)
-    (binderInfo : BinderInfo) : m ε :=
-  match kind with
-  | .lam => mkExprLam binderName binderType body binderInfo
-  | .pi => mkExprPi binderName binderType body binderInfo
+  mkExpr e := liftM (mkExpr e : m _)
 
 end LilLean

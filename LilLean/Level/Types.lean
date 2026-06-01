@@ -40,6 +40,9 @@ Note: One can make a recursive version of this type using
 structure LevelR where
   level : Level LevelR
 ```
+
+Warning: the `BEq` and `Hashable` instances on `Level` are not structural ---
+they make use of the corresponding instances on the handle type.
 -/
 inductive Level (ℓ : Type) where
   /-- Level `0`. -/
@@ -64,27 +67,26 @@ inductive Level (ℓ : Type) where
   | mvar  : LMVarId → Level ℓ
   deriving Inhabited
 
+instance {ℓ} : Inhabited (Level ℓ) := ⟨Level.param `_default⟩
+
 /--
 Object packaging up the level context state, making it possible to create
 a non-monadic interface for traversing level expressions.
 
 The `Level'` type includes a `LevelGetter` as an inductive type parameter.
-
-Normally an object like this is represented as a `class`
 -/
 structure LevelGetter (ℓ : Type) where
   /--
   Gets the level referred to by the handle `ℓ`.
-  Returns `Level.zero` for invalid handles, and may panic.
-  Should not return `Level.level`.
+  Returns `default` for invalid handles, and may panic.
   -/
-  get : ℓ → Level ℓ
+  getLevel : ℓ → Level ℓ
   /--
   Returns a hash of the level, using `Level.hashCore`. Additionally,
   - Bit 0 is 1 iff the level has a `param`.
   - Bit 1 is 1 iff the level has an `mvar`.
   -/
-  hash : ℓ → UInt64
+  levelHash : ℓ → UInt64
 
 /--
 Monad for traversing level expressions.
@@ -96,10 +98,10 @@ class MonadGetLevel (m : Type → Type) (ℓ : outParam Type) where
 export MonadGetLevel (getLevelGetter)
 
 def getLevel {ℓ m} [Monad m] [MonadGetLevel m ℓ] (u : ℓ) : m (Level ℓ) :=
-  return (← getLevelGetter).get u
+  return (← getLevelGetter).getLevel u
 
 def levelHash {ℓ m} [Monad m] [MonadGetLevel m ℓ] (u : ℓ) : m UInt64 :=
-  return (← getLevelGetter).hash u
+  return (← getLevelGetter).levelHash u
 
 /--
 Level handle that provides a functional interface to traverse its structure.
@@ -112,8 +114,8 @@ One can think of it as encoding a specific heap state in the type itself.
 
 Be careful to avoid keeping references to a `Level'`, since it creates
 non-linear uses of the underlying memory. E.g. the old `LevelContext` will
-persist, and `LevelContext.mkLevel` will result in allocating new copies of
-existing `LevelBlock`s. It's not a matter of correctness, just performance.
+persist, and `mkLevel` will result in allocating new copies of
+existing `LevelBlock`s. This is not a matter of correctness, just performance.
 -/
 structure Level' {ℓ : Type} (ctx : LevelGetter ℓ) where
   handle : ℓ

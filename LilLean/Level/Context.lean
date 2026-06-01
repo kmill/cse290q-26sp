@@ -366,8 +366,8 @@ def LevelContext.stats (ctx : LevelContext) : String :=
 
 @[inline] def LevelContext.levelGetter (ctx : LevelContext) :
     LevelGetter LevelId where
-  get := ctx.get
-  hash := ctx.getHash
+  getLevel := ctx.get
+  levelHash := ctx.getHash
 
 /--
 Class for monads that contain `LevelContext` state.
@@ -469,7 +469,7 @@ tracing garbage collection step before returning from `withNewLevelRegion`.
 -/
 partial def promoteLevel {m : Type → Type} [MonadLevelContext m]
     (u : LevelId) : m LevelId :=
-  modifyGetLevelContext <| (promoteLevelCore u).run
+  modifyGetLevelContext (promoteLevelCore u).run
 
 end Promote
 
