@@ -14,6 +14,8 @@
 
 * Conor McBride. "Elimination with a Motive." Types for Proofs and Programs. TYPES 2000. Lecture Notes in Computer Science, vol 2277. https://doi.org/10.1007/3-540-45842-5_13 (19 pages)
 
+* Conor McBride and James McKinna. "Functional pearl: I am not a number---I am a free variable." Proceedings of the 2004 ACM SIGPLAN workshop on Haskell. https://doi.org/10.1145/1017472.1017477 (9 pages)
+
 ## Lean
 
 * Leonardo de Moura and Sebastian Ullrich. "The Lean 4 Theorem Prover and Programming Language." Automated Deduction – CADE 28: 28th International Conference on Automated Deduction (2021). https://doi.org/10.1007/978-3-030-79876-5_37 https://lean-lang.org/papers/lean4.pdf (11 pages)
