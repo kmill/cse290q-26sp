@@ -76,6 +76,12 @@ Location: Baskin 165
 
 *Abstract.* Memory prefetching is a systems optimization where future memory accesses are predicted and loaded early to reduce cache misses. I formalized a small tutorial-style model of prefetching in Lean 4, including finite traces, infinite streams, a simple cache model, online prefetchers, and oracle prefetchers. I will discuss the modeling choices, show executable examples, and explain how the formalization clarifies the benchmark relationship between real online prefetchers and an oracle with future knowledge.
 
+### 15:00–15:15. Evaluating Lean as an intermediate representation for Neuro-Symbolic Large Language Models
+
+**Jonathan Morris**
+
+Logical reasoning remains a fundamental challenge for Large Language Models (LLMs), particularly in high-stakes domains where users need to inspect, verify, and trust intermediate reasoning steps. Recent approaches such as Chain-of-Thought (CoT), Symbolic Chain-of-Thought (SymbCoT), and neuro-symbolic systems such as LogicLM and ProSLM have made meaningful progress toward more interpretable reasoning. In this work, I evaluate the effectiveness of neuro-symbolic LLMs with Lean as an intermediate representation. I compare Lean primarily against similar models that use Prolog as an intermediate representation and I compare them both against chain of thought and zero-shot prompting on FOLIO, LegalBench, and Pumed datasets. I also evaluate each model's explainabllity by using an LLM as judge.
+
 ## Session 2: Asynchronous
 
 These talks will be prerecorded and posted to Zulip for asynchronous Q/A.
