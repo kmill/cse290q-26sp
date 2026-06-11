@@ -22,3 +22,7 @@ VS Code tip: on the "Lean Infoview" panel, click the "..." and select "Lock Grou
 * Metaprogramming in Lean https://github.com/arthurpaulino/lean4-metaprogramming-book
 * Homotopy Type Theory https://homotopytypetheory.org/book/
 * Type Checking in Lean 4 https://ammkrn.github.io/type_checking_in_lean4/
+
+## Final presentations
+
+[Schedule](https://github.com/kmill/cse290q-26sp/blob/main/presentations.md)
