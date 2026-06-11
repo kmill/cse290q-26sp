@@ -82,6 +82,12 @@ Location: Baskin 165
 
 *Abstract.* Logical reasoning remains a fundamental challenge for Large Language Models (LLMs), particularly in high-stakes domains where users need to inspect, verify, and trust intermediate reasoning steps. Recent approaches such as Chain-of-Thought (CoT), Symbolic Chain-of-Thought (SymbCoT), and neuro-symbolic systems such as LogicLM and ProSLM have made meaningful progress toward more interpretable reasoning. In this work, I evaluate the effectiveness of neuro-symbolic LLMs with Lean as an intermediate representation. I compare Lean primarily against similar models that use Prolog as an intermediate representation and I compare them both against chain of thought and zero-shot prompting on FOLIO, LegalBench, and Pumed datasets. I also evaluate each model's explainabllity by using an LLM as judge.
 
+### 15:15-15:30. Adventures in OCaml: Implementing a Tiny DTT Language
+
+**Korben Tompkin**
+
+*Abstract.* I set out to implement a small DTT Language in OCaml, a language I had no prior experience with. I learned that the difficult parts of implementing a theorem prover were not what I expected, as well as why ML-family languages are so popular for building these systems. This presentation focuses on the learning process, and the resulting shift in my understanding of the problem.
+
 ## Session 2: Asynchronous
 
 These talks will be prerecorded and posted to Zulip for asynchronous Q/A.
