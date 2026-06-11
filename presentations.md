@@ -1,5 +1,7 @@
 # CSE 290Q Final Presentations
 
+[Link to schedule.](https://github.com/kmill/cse290q-26sp/blob/main/presentations.md)
+
 ## Session 1: Thursday, June 11
 
 Location: Baskin 165
